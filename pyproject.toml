@@ -1,7 +1,12 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "stravation"
 version = "0.1.0"
 description = "Strava → Notion + Prévision + Google Calendar (rappels matin) — clean & minimal"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "typer>=0.12",
@@ -17,5 +22,18 @@ dependencies = [
   "python-dotenv>=1.0.1",
 ]
 
+# UI optionnelle (install: `pip install -e .[ui]`)
+[project.optional-dependencies]
+ui = [
+  "customtkinter>=5.2",
+]
+
 [project.scripts]
-stravation = "stravation.cli:app"   # 👈 nouveau nom de commande
+stravation = "stravation.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/hugolag64/Stravation"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["stravation*"]

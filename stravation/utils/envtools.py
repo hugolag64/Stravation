@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+from pathlib import Path
 from typing import Dict, Tuple
 
 ENV_GROUPS = {
@@ -46,6 +47,71 @@ REQUIRED_KEYS = {
     # GOOGLE_CREDENTIALS_PATH ou GOOGLE_CREDENTIALS_JSON
 }
 
+
+# ───────────────────────────────────────────────
+# Chargeur .env maison
+# ───────────────────────────────────────────────
+from pathlib import Path
+import os, codecs
+
+def load_dotenv_if_exists() -> None:
+    """
+    Charge .env en détectant l'encodage (UTF-8, UTF-8 BOM, UTF-16 LE/BE).
+    - Ignore lignes vides et commentaires (#)
+    - N'écrase pas les variables déjà présentes
+    - Nettoie les NUL (\x00) et guillemets d'encadrement
+    """
+    def _read_text_smart(path: Path) -> str:
+        data = path.read_bytes()
+        # Détection BOM
+        if data.startswith(codecs.BOM_UTF8):
+            return data.decode("utf-8-sig", errors="replace")
+        if data.startswith(codecs.BOM_UTF16_LE) or data.startswith(codecs.BOM_UTF16_BE):
+            return data.decode("utf-16", errors="replace")
+        # Heuristique: beaucoup de NUL → UTF-16
+        if b"\x00" in data[:200]:
+            try:
+                return data.decode("utf-16", errors="replace")
+            except Exception:
+                pass
+        # Fallback UTF-8
+        try:
+            return data.decode("utf-8", errors="replace")
+        except Exception:
+            # Dernier ressort : cp1252
+            return data.decode("cp1252", errors="replace")
+
+    # Cherche .env dans cwd puis à la racine du projet
+    candidates = [Path.cwd() / ".env", Path(__file__).resolve().parents[2] / ".env"]
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        text = _read_text_smart(candidate)
+
+        for raw_line in text.splitlines():
+            line = raw_line.replace("\x00", "").strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+
+            # Retire guillemets d'encadrement éventuels
+            if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+                v = v[1:-1]
+
+            # Valeur clean
+            v = v.replace("\x00", "").strip()
+
+            if k and k not in os.environ:
+                os.environ[k] = v
+        break
+
+
+
+# ───────────────────────────────────────────────
+# Générateurs et vérifs
+# ───────────────────────────────────────────────
 def generate_env_example() -> str:
     lines = [
         "# Stravanotion — .env.example",
@@ -84,12 +150,14 @@ def generate_env_example() -> str:
     ]
     return "\n".join(lines)
 
+
 def write_env_example(path: str = ".env.example", overwrite: bool = False) -> str:
     if os.path.exists(path) and not overwrite:
         return path
     with open(path, "w", encoding="utf-8") as f:
         f.write(generate_env_example())
     return path
+
 
 def check_env() -> Tuple[Dict[str, bool], Dict[str, str]]:
     """
@@ -114,9 +182,11 @@ def check_env() -> Tuple[Dict[str, bool], Dict[str, str]]:
         errors["GOOGLE_CREDENTIALS_PATH|JSON"] = "spécifie un fichier ou un JSON compact"
 
     # Optionnels: juste pour info
-    for k in ["NOTION_DB_PLANNING", "SPORT_TZ", "SPORT_MORNING_TIME", "SPORT_SESSION_TIME",
-              "SPORT_DB_PATH", "GOOGLE_TOKEN_PATH", "SPORT_CAL_NAME",
-              "RATE_SAFETY", "DOWNLOAD_GPX", "GPX_DIR", "GPX_MAX_PER_RUN"]:
+    for k in [
+        "NOTION_DB_PLANNING", "SPORT_TZ", "SPORT_MORNING_TIME", "SPORT_SESSION_TIME",
+        "SPORT_DB_PATH", "GOOGLE_TOKEN_PATH", "SPORT_CAL_NAME",
+        "RATE_SAFETY", "DOWNLOAD_GPX", "GPX_DIR", "GPX_MAX_PER_RUN"
+    ]:
         status[k] = bool(os.getenv(k, "")) or True  # considéré ok même si vide/non requis
 
     return status, errors

@@ -1,21 +1,48 @@
-﻿# Environnements virtuels
+﻿# ─── Environnements virtuels ──────────────────────────────
 .venv/
 venv/
 env/
 
-# Secrets
+# ─── Secrets ───────────────────────────────────────────────
 .env
-.env.local
+.env.*
+.gcal_token.json
+token_*.json
+credentials.json
 
-# Python cache/compilés
+# ─── Python ────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 
-# Fichiers build/egg
+# ─── Fichiers de build / packaging ─────────────────────────
 *.egg-info/
 build/
 dist/
 
-# Bases locales
+# ─── Bases locales ────────────────────────────────────────
 *.sqlite3
+
+# ─── Logs & caches ────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.cache/
+httpx_cache/
+
+# ─── Données export/import ─────────────────────────────────
+exports/
+gpx/
+*.gpx
+*.csv
+*.json
+
+# ─── Éditeurs / IDE ───────────────────────────────────────
+.vscode/
+.idea/
+*.iml
+
+# ─── OS / divers ──────────────────────────────────────────
+.DS_Store
+Thumbs.db

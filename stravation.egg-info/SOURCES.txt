@@ -20,10 +20,16 @@ stravation/integrations/__init__.py
 stravation/integrations/gcal_client.py
 stravation/integrations/notion_client.py
 stravation/integrations/strava_client.py
+stravation/services/__init__.py
+stravation/services/gcal_service.py
+stravation/services/notion_plans.py
+stravation/services/strava_service.py
 stravation/storage/__init__.py
 stravation/storage/dates.py
 stravation/storage/db.py
 stravation/storage/idempotency.py
+stravation/ui/__init__.py
+stravation/ui/mini_app.py
 stravation/utils/dates.py
 stravation/utils/envtools.py
 stravation/utils/idempotency.py

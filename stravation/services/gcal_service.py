@@ -1,5 +1,8 @@
+# services/google_calendar.py
 from __future__ import annotations
-import os, pathlib, shutil
+import os
+import json
+import pathlib
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 
@@ -9,62 +12,90 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
+from stravation.utils.envtools import load_dotenv_if_exists
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────────────────
+# Scope large: création/lecture/màj de calendriers + événements.
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 CACHE_DIR = pathlib.Path(".cache")
 CACHE_DIR.mkdir(exist_ok=True)
 TOKEN_PATH = CACHE_DIR / "gcal_token.json"
 
+# Priorité à GOOGLE_CREDENTIALS_JSON (JSON minifié sur une seule ligne),
+# sinon GOOGLE_CREDENTIALS_PATH (chemin vers credentials.json).
+ENV_JSON = "GOOGLE_CREDENTIALS_JSON"
+ENV_PATH = "GOOGLE_CREDENTIALS_PATH"
 
+
+def _sport_tz() -> str:
+    return os.getenv("SPORT_TZ", "Indian/Reunion")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auth
+# ─────────────────────────────────────────────────────────────────────────────
 def _load_credentials() -> Credentials:
     """
-    Charge les creds OAuth 2.0 :
-    - d'abord depuis le token cache (.cache/gcal_token.json),
-    - sinon via GOOGLE_CREDENTIALS_JSON (contenu du JSON en une ligne),
-    - ou via GOOGLE_CREDENTIALS_JSON_FILE (chemin vers le fichier client_secret*.json).
-
-    Au premier run, ouvre le flow local (navigateur).
+    Charge/rafraîchit les credentials OAuth2.
+    1) Tente depuis le token cache
+    2) Sinon, ouvre un flow basé sur GOOGLE_CREDENTIALS_JSON ou GOOGLE_CREDENTIALS_PATH
     """
+    load_dotenv_if_exists()
+
     creds: Optional[Credentials] = None
 
     # 1) Token cache
     if TOKEN_PATH.exists():
         creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
 
-    # 2) Refresh ou nouveau flow
+    # 2) Refresh ou consent initial
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
+            # Refresh silencieux
             creds.refresh(Request())
         else:
-            raw = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
-            file_path = os.getenv("GOOGLE_CREDENTIALS_JSON_FILE", "")
+            json_str = os.getenv(ENV_JSON, "").strip()
+            path_str = os.getenv(ENV_PATH, "").strip()
 
-            if not raw and not file_path:
+            if json_str:
+                # JSON compact en .env → flow depuis dict
+                try:
+                    client_config = json.loads(json_str)
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(
+                        f"{ENV_JSON} invalide (JSON non décodable) : {e}"
+                    )
+                flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+            elif path_str:
+                p = pathlib.Path(path_str).expanduser()
+                if not p.exists():
+                    raise FileNotFoundError(f"credentials.json introuvable : {p}")
+                flow = InstalledAppFlow.from_client_secrets_file(str(p), SCOPES)
+            else:
                 raise RuntimeError(
-                    "Fournis GOOGLE_CREDENTIALS_JSON (contenu minifié en une seule ligne) "
-                    "ou GOOGLE_CREDENTIALS_JSON_FILE (chemin du fichier credentials.json)."
+                    f"Aucun credentials Google détecté. Renseigne {ENV_JSON} (JSON compact) "
+                    f"ou {ENV_PATH} (chemin vers credentials.json)."
                 )
 
-            client_path = CACHE_DIR / "client_secret.json"
-            if raw:
-                client_path.write_text(raw, encoding="utf-8")
-            else:
-                src = pathlib.Path(file_path).expanduser()
-                if not src.exists():
-                    raise FileNotFoundError(f"Fichier credentials introuvable: {src}")
-                shutil.copyfile(src, client_path)
+            # Ouvre le navigateur pour consentir (une seule fois)
+            creds = flow.run_local_server(port=0, prompt="consent")
 
-            flow = InstalledAppFlow.from_client_secrets_file(str(client_path), SCOPES)
-            creds = flow.run_local_server(port=0)
-            TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+        # Persist token
+        TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
 
     return creds
 
 
 def _service():
+    """Client Google Calendar authentifié (discovery cache désactivé)."""
     return build("calendar", "v3", credentials=_load_credentials(), cache_discovery=False)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# API helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def ensure_calendar(summary: str) -> str:
     """Retourne l'ID d'un calendrier nommé `summary`, en le créant si besoin."""
@@ -73,16 +104,19 @@ def ensure_calendar(summary: str) -> str:
     for c in cals:
         if c.get("summary") == summary:
             return c["id"]
+
     # create
     new_cal = svc.calendars().insert(
-        body={"summary": summary, "timeZone": os.getenv("SPORT_TZ", "Indian/Reunion")}
+        body={"summary": summary, "timeZone": _sport_tz()}
     ).execute()
+
     # s’abonner pour qu’il apparaisse dans la liste
     svc.calendarList().insert(body={"id": new_cal["id"]}).execute()
     return new_cal["id"]
 
 
 def list_events(calendar_id: str, time_min_iso: str, time_max_iso: str) -> List[Dict]:
+    """Liste les événements [timeMin; timeMax[ triés par startTime."""
     svc = _service()
     res = (
         svc.events()
@@ -101,16 +135,17 @@ def list_events(calendar_id: str, time_min_iso: str, time_max_iso: str) -> List[
 def upsert_sport_event(
     *,
     calendar_id: str,
-    start_iso: str,  # "YYYY-MM-DDTHH:MM:SS+04:00"
+    start_iso: str,            # "YYYY-MM-DDTHH:MM:SS+04:00"
     duration_min: int,
     title: str,
     description: str = "",
     external_key: Optional[str] = None,  # ex. notion_page_id
-    color_id: str = "9",  # Blueberry
-):
+    color_id: str = "9",                 # Blueberry
+) -> str:
     """
     Crée/met à jour un event (clé = extendedProperties.private.notion_page_id).
     Si external_key est None, on ne fait que CREATE (pas d’upsert).
+    Retourne l'eventId.
     """
     svc = _service()
     start = datetime.fromisoformat(start_iso)
@@ -120,8 +155,8 @@ def upsert_sport_event(
         "summary": title,
         "description": description,
         "colorId": color_id,
-        "start": {"dateTime": start.isoformat(), "timeZone": os.getenv("SPORT_TZ", "Indian/Reunion")},
-        "end": {"dateTime": end.isoformat(), "timeZone": os.getenv("SPORT_TZ", "Indian/Reunion")},
+        "start": {"dateTime": start.isoformat(), "timeZone": _sport_tz()},
+        "end": {"dateTime": end.isoformat(), "timeZone": _sport_tz()},
     }
     if external_key:
         body["extendedProperties"] = {"private": {"notion_page_id": external_key}}

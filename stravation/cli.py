@@ -14,9 +14,16 @@ from .integrations.gcal_client import (
     push_morning_reminder,
 )
 from .features.strava_to_notion import sync_strava_to_notion
-from .features.routes_to_notion import sync_strava_routes_to_notion
+from .features.routes_to_notion import (
+    sync_strava_routes_to_notion,
+    _iter_strava_routes,             # pour routes-count
+    list_notion_routes_index,        # ➜ nouvel index Notion
+)
 from .utils.envtools import write_env_example, check_env
-from .storage import db  # NEW: outils cache (SQLite)
+from .storage import db  # outils cache (SQLite)
+
+import os
+from notion_client import Client as Notion
 
 app = typer.Typer(help="Stravation — propre, minimal, extensible.")
 
@@ -224,18 +231,126 @@ def cmd_backfill(
 # Strava → Notion (Mes itinéraires → 🗺️ Projets GPX)
 # ──────────────────────────────────────────────────────────────────────────────
 @app.command("sync-strava-routes")
-def cmd_sync_strava_routes():
+def cmd_sync_strava_routes(
+    force: bool = typer.Option(False, "--force", help="Force la resynchronisation de toutes les routes")
+):
     """
     Importe / met à jour les itinéraires (“Mes itinéraires”) dans la DB 🗺️ Projets GPX.
-    - Upsert par “Strava Route ID” si la colonne existe
-    - Renseigne le type de sport, la distance, le D+, l’URL GPX, le lien Strava
-    - Crée les relations Départ / Arrivée vers la DB “Lieux” quand possible
+    - Incrémental par défaut (ne traite que les nouvelles / modifiées)
+    - Option --force pour tout retravailler
     """
-    created, skipped = sync_strava_routes_to_notion()
+    created, skipped = sync_strava_routes_to_notion(force=force)
+    total = created + skipped
     print(
         f"[ok]Sync Routes terminée[/] — créés/mis à jour: [bold]{created}[/], "
-        f"déjà vus: [muted]{skipped}[/]"
+        f"skippés (inchangés): [muted]{skipped}[/], total (compte local): [bold]{total}[/]"
     )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lecture seule : compter les routes Strava (sans écrire)
+# ──────────────────────────────────────────────────────────────────────────────
+@app.command("routes-count")
+def routes_count(
+    sample: int = typer.Option(0, "--sample", "-n", help="Affiche les N premiers titres en échantillon.")
+):
+    """Compte les routes présentes dans 'Mes itinéraires' Strava (sans toucher Notion)."""
+    count = 0
+    titles: list[str] = []
+    for rt in _iter_strava_routes():
+        count += 1
+        if sample and len(titles) < sample:
+            name = (rt.get("name") or f"Route {rt.get('id')}")
+            titles.append(name)
+    print(f"[title]Routes Strava détectées[/]")
+    print(f"• Total: [bold]{count}[/]")
+    if titles:
+        print(f"• Échantillon ({len(titles)}):")
+        for t in titles:
+            print(f"  - {t}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lecture seule : compter les pages réellement en DB Notion
+# ──────────────────────────────────────────────────────────────────────────────
+@app.command("routes-db-count")
+def routes_db_count():
+    """Compte les pages dans la DB Notion pointée par NOTION_DB_GPX (toutes vues confondues)."""
+    notion_token = os.getenv("NOTION_API_KEY")
+    db_id = os.getenv("NOTION_DB_GPX")
+    if not notion_token or not db_id:
+        print("[err]NOTION_API_KEY ou NOTION_DB_GPX manquant(e). Lance 'stravation env-check'.[/]")
+        raise typer.Exit(code=1)
+
+    notion = Notion(auth=notion_token)
+    index = list_notion_routes_index(notion, db_id)
+    print(f"[title]Pages en DB Notion[/]")
+    print(f"• Database ID : [bold]{db_id}[/]")
+    print(f"• Total (API) : [bold]{len(index)}[/]")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ➜ NOUVEAU : Diff Strava ↔ Notion
+# ──────────────────────────────────────────────────────────────────────────────
+@app.command("routes-diff")
+def routes_diff(
+    show: bool = typer.Option(False, "--show", help="Affiche les listes complètes (sinon résumé)."),
+    sample: int = typer.Option(20, "--sample", "-n", help="Si --show n'est pas passé, nombre d’éléments à lister.")
+):
+    """
+    Compare la liste Strava (Mes itinéraires) et la DB Notion (NOTION_DB_GPX) par ID de route.
+    Affiche:
+      • Manquantes dans Notion
+      • Orphelines dans Notion (absentes de Strava)
+    """
+    notion_token = os.getenv("NOTION_API_KEY")
+    db_id = os.getenv("NOTION_DB_GPX")
+    if not notion_token or not db_id:
+        print("[err]NOTION_API_KEY ou NOTION_DB_GPX manquant(e).[/]")
+        raise typer.Exit(code=1)
+
+    # Strava → {id: name}
+    strava = {}
+    for rt in _iter_strava_routes():
+        strava[str(rt["id"])] = (rt.get("name") or f"Route {rt['id']}")
+
+    # Notion → {id: {page_id, title}}
+    notion = Notion(auth=notion_token)
+    notion_index = list_notion_routes_index(notion, db_id)
+
+    s_ids = set(strava.keys())
+    n_ids = set(notion_index.keys())
+
+    missing_in_notion = sorted(s_ids - n_ids, key=int)
+    orphan_in_notion  = sorted(n_ids - s_ids, key=int)
+
+    print("[title]Diff Strava ↔ Notion[/]")
+    print(f"• Strava total : [bold]{len(s_ids)}[/]")
+    print(f"• Notion total : [bold]{len(n_ids)}[/]")
+    print(f"• Manquantes dans Notion : [bold]{len(missing_in_notion)}[/]")
+    print(f"• Orphelines dans Notion : [bold]{len(orphan_in_notion)}[/]")
+
+    def _print_list(title: str, ids: list[str]):
+        if not ids:
+            print(f"  {title}: rien à signaler.")
+            return
+        if show:
+            print(f"\n{title} ({len(ids)}):")
+            for rid in ids:
+                left = strava.get(rid, "")
+                right = notion_index.get(rid, {}).get("title", "")
+                label = left or right or rid
+                print(f"  - {rid} — {label}")
+        else:
+            head = ids[:sample]
+            print(f"\n{title} (aperçu {len(head)}/{len(ids)}):")
+            for rid in head:
+                left = strava.get(rid, "")
+                right = notion_index.get(rid, {}).get("title", "")
+                label = left or right or rid
+                print(f"  - {rid} — {label}")
+            if len(ids) > len(head):
+                print(f"  … (+{len(ids)-len(head)} autres)")
+
+    _print_list("➤ Manquantes dans Notion", missing_in_notion)
+    _print_list("➤ Orphelines dans Notion", orphan_in_notion)
 
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

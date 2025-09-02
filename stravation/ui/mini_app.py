@@ -1,27 +1,37 @@
+# stravation/ui/mini_app.py
 from __future__ import annotations
+
 import os
+from typing import List, Dict, Optional
+
 import customtkinter as ctk
 import pendulum as p
-from typing import List, Dict, Optional
-import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from services.strava_service import StravaService
-from services.notion_plans import (
+from stravation.utils.envtools import load_dotenv_if_exists
+load_dotenv_if_exists()
+# ✅ Imports ABSOLUS depuis le paquet stravation (plus de ModuleNotFoundError)
+from stravation.services.strava_service import StravaService
+from stravation.services.notion_plans import (
     create_plan, update_plan, find_plans_on_day, page_to_form_defaults,
     find_plans_in_range, page_date_local_iso, ENDURANCE, WOD_ONLY
 )
-from services.gcal_service import (
+from stravation.services.gcal_service import (
     ensure_calendar, upsert_sport_event, month_shifts
 )
 
+# ───────────────────────────── Constantes UI / Mapping ─────────────────────────────
 SPORTS_UI = ["Tous", "Course à pied", "Trail", "Vélo", "CrossFit", "Hyrox"]
 STRAVA_TO_UI = {
-    "Run": "Course à pied", "TrailRun": "Trail", "Ride": "Vélo",
-    "VirtualRide": "Vélo", "Workout": "CrossFit", "WeightTraining": "CrossFit",
+    "Run": "Course à pied",
+    "TrailRun": "Trail",
+    "Ride": "Vélo",
+    "VirtualRide": "Vélo",
+    "Workout": "CrossFit",
+    "WeightTraining": "CrossFit",
 }
 UI_TO_STRAVA = {v: k for k, v in STRAVA_TO_UI.items()}
 PADDING = 14
 
+# Mode visuel sobre “Apple-like”
 ctk.set_default_color_theme("dark-blue")
 ctk.set_appearance_mode("dark")
 
@@ -69,7 +79,7 @@ class ImportTab(ctk.CTkFrame):
             w.destroy()
         filt = self.sport_filter.get()
         for a in self.rows:
-            sport_ui = STRAVA_TO_UI.get(a["sport_type"], "Course à pied")
+            sport_ui = STRAVA_TO_UI.get(a.get("sport_type"), "Course à pied")
             if filt != "Tous" and sport_ui != filt:
                 continue
             self._card(self.scroll, a, sport_ui)
@@ -79,17 +89,17 @@ class ImportTab(ctk.CTkFrame):
         card.pack(fill="x", pady=6)
 
         # Titre + méta
-        ctk.CTkLabel(card, text=f"{act['name']} — {act['start_local']}") \
+        ctk.CTkLabel(card, text=f"{act.get('name')} — {act.get('start_local')}", anchor="w") \
             .grid(row=0, column=0, columnspan=6, sticky="w", padx=10, pady=(10, 4))
         ctk.CTkLabel(
             card,
-            text=f"{sport_ui} · {act['distance_km']} km · {act['moving_time_min']} min · D+ {act['elevation_gain_m']} m",
+            text=f"{sport_ui} · {act.get('distance_km')} km · {act.get('moving_time_min')} min · D+ {act.get('elevation_gain_m')} m",
             text_color="#A0A0A0",
         ).grid(row=1, column=0, columnspan=6, sticky="w", padx=10, pady=(0, 10))
 
         # Éditables (Strava live: name, sport_type, description)
         ctk.CTkLabel(card, text="Nom").grid(row=2, column=0, sticky="e", padx=6, pady=6)
-        v_name = ctk.StringVar(value=act["name"])
+        v_name = ctk.StringVar(value=act.get("name"))
         ctk.CTkEntry(card, textvariable=v_name, width=300).grid(row=2, column=1, padx=(0, 16))
 
         ctk.CTkLabel(card, text="Sport").grid(row=2, column=2, sticky="e", padx=6)
@@ -283,9 +293,12 @@ class DayEditor(ctk.CTkFrame):
 
         # Push automatique vers Google Calendar "Sport"
         try:
-            sport_cal_id = ensure_calendar(os.getenv("SPORT_CALENDAR_SUMMARY", "Sport"))
-            # Respecte la timezone locale
-            start_local = p.parse(date_iso_for_notion).in_timezone(os.getenv("SPORT_TZ", "Indian/Reunion"))
+            sport_cal_summary = os.getenv("SPORT_CALENDAR_SUMMARY", "Sport")
+            sport_cal_id = ensure_calendar(sport_cal_summary)
+
+            # Respecte la timezone locale (par défaut Réunion)
+            tz = os.getenv("SPORT_TZ", "Indian/Reunion")
+            start_local = p.parse(date_iso_for_notion).in_timezone(tz)
             start_iso = start_local.to_iso8601_string()
             dur = int(float(self.f_duree.get() or 60)) if self.f_duree.get().strip() else 60
 
@@ -299,7 +312,7 @@ class DayEditor(ctk.CTkFrame):
                 color_id="9",
             )
         except Exception as e:
-            # On n'affiche pas le traceback ici pour garder l'UI clean
+            # UI sobre : on loggue en console, pas de traceback dans l’UI
             print("[GCal] Erreur push:", e)
 
         self.btn.configure(text="Enregistré ✅")

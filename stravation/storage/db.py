@@ -1,87 +1,104 @@
+# stravation/storage/db.py
 from __future__ import annotations
-import os
-import sqlite3
-from typing import Tuple, Optional
+import os, sqlite3, pendulum as p
+from typing import Optional, Iterable, Dict, Tuple
 
-from ..config import DB_PATH
+DB_PATH = os.getenv("SPORT_DB_PATH", "stravation.sqlite3")
 
-DDL = """
-CREATE TABLE IF NOT EXISTS checkpoints(
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS seen_activities(
-  strava_id TEXT PRIMARY KEY
-);
-"""
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Connexion & schéma
-# ──────────────────────────────────────────────────────────────────────────────
-def connect() -> sqlite3.Connection:
-    first = not os.path.exists(DB_PATH)
+# ── connexion unique ───────────────────────────────────────────────────────────
+def _connect() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
-    if first:
-        con.executescript(DDL)
-        con.commit()
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    con.execute("PRAGMA foreign_keys=ON;")
     return con
 
-def ensure_schema() -> None:
-    with connect() as con:
-        con.executescript(DDL)
-        con.commit()
+# ── init DB & migrations légères ──────────────────────────────────────────────
+def init_db() -> None:
+    con = _connect()
+    cur = con.cursor()
 
-def db_path() -> str:
-    return DB_PATH
+    # Checkpoints génériques (si tu les utilises ailleurs)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS checkpoints (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Checkpoints
-# ──────────────────────────────────────────────────────────────────────────────
+    # Activités déjà vues (existant probable) — on ne modifie pas
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS seen_activities (
+        strava_id INTEGER PRIMARY KEY,
+        seen_at TEXT NOT NULL
+    )
+    """)
+
+    # ✅ N O U V E A U : routes déjà vues (mémoire incrémentale)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS seen_routes (
+        route_id INTEGER PRIMARY KEY,
+        updated_at TEXT,            -- si Strava fournit "updated_at" sur les routes
+        checksum TEXT,              -- fallback (ex: hash sur nom+distance si besoin)
+        synced_at TEXT NOT NULL     -- date locale du dernier sync réussi
+    )
+    """)
+
+    con.commit()
+    con.close()
+
+# ── helpers checkpoints ───────────────────────────────────────────────────────
 def get_checkpoint(key: str) -> Optional[str]:
-    with connect() as con:
-        cur = con.execute("SELECT value FROM checkpoints WHERE key=?", (key,))
-        row = cur.fetchone()
-        return row[0] if row else None
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("SELECT value FROM checkpoints WHERE key=?", (key,))
+    row = cur.fetchone()
+    con.close()
+    return row[0] if row else None
 
 def set_checkpoint(key: str, value: str) -> None:
-    with connect() as con:
-        con.execute("REPLACE INTO checkpoints(key,value) VALUES(?,?)", (key, value))
-        con.commit()
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("INSERT INTO checkpoints(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    con.commit()
+    con.close()
 
-def clear_checkpoints() -> int:
-    with connect() as con:
-        cur = con.execute("DELETE FROM checkpoints;")
-        con.commit()
-        return cur.rowcount
+# ── helpers seen_routes (N O U V E A U) ───────────────────────────────────────
+def get_seen_routes() -> Dict[int, Tuple[Optional[str], Optional[str]]]:
+    """
+    Retourne {route_id: (updated_at, checksum)}
+    """
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("SELECT route_id, updated_at, checksum FROM seen_routes")
+    out = {int(rid): (upd, chk) for (rid, upd, chk) in cur.fetchall()}
+    con.close()
+    return out
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Seen activities
-# ──────────────────────────────────────────────────────────────────────────────
-def is_seen(strava_id: str) -> bool:
-    with connect() as con:
-        cur = con.execute("SELECT 1 FROM seen_activities WHERE strava_id=?", (strava_id,))
-        return cur.fetchone() is not None
+def mark_route_seen(route_id: int, *, updated_at: Optional[str], checksum: Optional[str]) -> None:
+    """
+    Upsert une route comme 'vue' après sync OK.
+    """
+    con = _connect()
+    cur = con.cursor()
+    now_iso = p.now().to_datetime_string()  # "YYYY-MM-DD HH:mm:ss"
+    cur.execute("""
+        INSERT INTO seen_routes(route_id, updated_at, checksum, synced_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(route_id) DO UPDATE SET
+            updated_at = excluded.updated_at,
+            checksum = excluded.checksum,
+            synced_at = excluded.synced_at
+    """, (int(route_id), updated_at, checksum, now_iso))
+    con.commit()
+    con.close()
 
-def mark_seen(strava_id: str) -> None:
-    with connect() as con:
-        con.execute("REPLACE INTO seen_activities(strava_id) VALUES(?)", (strava_id,))
-        con.commit()
-
-def clear_seen() -> int:
-    with connect() as con:
-        cur = con.execute("DELETE FROM seen_activities;")
-        con.commit()
-        return cur.rowcount
-
-def counts() -> Tuple[int, int]:
-    """Retourne (nb_checkpoints, nb_seen)."""
-    with connect() as con:
-        c1 = con.execute("SELECT COUNT(*) FROM checkpoints;").fetchone()[0]
-        c2 = con.execute("SELECT COUNT(*) FROM seen_activities;").fetchone()[0]
-        return int(c1), int(c2)
-
-def reset_all() -> Tuple[int, int]:
-    """Vide checkpoints + seen_activities."""
-    n1 = clear_checkpoints()
-    n2 = clear_seen()
-    return n1, n2
+def forget_routes(route_ids: Iterable[int]) -> None:
+    """
+    Permet de 'oublier' des routes (pour re-synchroniser uniquement celles-ci).
+    """
+    con = _connect()
+    cur = con.cursor()
+    cur.executemany("DELETE FROM seen_routes WHERE route_id=?", [(int(r),) for r in route_ids])
+    con.commit()
+    con.close()

@@ -1,3 +1,4 @@
+# stravation/config.py
 from __future__ import annotations
 import os
 from dotenv import load_dotenv
@@ -52,3 +53,22 @@ RATE_SAFETY = float(os.getenv("RATE_SAFETY", "0.15"))
 DOWNLOAD_GPX = _bool(os.getenv("DOWNLOAD_GPX"), default=False)
 GPX_DIR = os.getenv("GPX_DIR", "gpx")
 GPX_MAX_PER_RUN = int(os.getenv("GPX_MAX_PER_RUN", "10"))
+
+
+# ──────────────────────────────────────────────
+# Validation des variables d'environnement requises
+# ──────────────────────────────────────────────
+REQUIRED_ENV = [
+    "NOTION_API_KEY",
+    "NOTION_DB_ACTIVITIES",
+    "STRAVA_CLIENT_ID",
+    "STRAVA_CLIENT_SECRET",
+    "STRAVA_REFRESH_TOKEN",
+]
+
+_missing = [k for k in REQUIRED_ENV if not os.getenv(k)]
+if _missing:
+    raise RuntimeError(
+        f"Variables d'environnement manquantes: {', '.join(_missing)}\n"
+        f"👉 Vérifie ton fichier .env"
+    )
