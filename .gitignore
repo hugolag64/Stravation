@@ -1,0 +1,21 @@
+﻿# Environnements virtuels
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+.env.local
+
+# Python cache/compilés
+__pycache__/
+*.pyc
+*.pyo
+
+# Fichiers build/egg
+*.egg-info/
+build/
+dist/
+
+# Bases locales
+*.sqlite3

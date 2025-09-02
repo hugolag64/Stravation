@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: stravation
+Version: 0.1.0
+Summary: Strava → Notion + Prévision + Google Calendar (rappels matin) — clean & minimal
+Requires-Python: >=3.10
+Requires-Dist: typer>=0.12
+Requires-Dist: rich>=13.7
+Requires-Dist: pendulum>=3.0
+Requires-Dist: pydantic>=2.7
+Requires-Dist: httpx>=0.27
+Requires-Dist: google-api-python-client>=2.149.0
+Requires-Dist: google-auth>=2.34.0
+Requires-Dist: google-auth-oauthlib>=1.2.1
+Requires-Dist: notion-client>=2.2.1
+Requires-Dist: sqlite-utils>=3.36
+Requires-Dist: python-dotenv>=1.0.1

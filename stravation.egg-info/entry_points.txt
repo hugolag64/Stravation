@@ -1,0 +1,2 @@
+[console_scripts]
+stravation = stravation.cli:app
