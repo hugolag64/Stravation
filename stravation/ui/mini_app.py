@@ -17,7 +17,7 @@ from stravation.services.notion_plans import (
     create_plan, update_plan, find_plans_on_day, page_to_form_defaults,
     find_plans_in_range, page_date_local_iso, ENDURANCE, WOD_ONLY
 )
-from stravation.services.gcal_service import (
+from stravation.services.google_calendar import (
     ensure_calendar, upsert_sport_event, month_shifts
 )
 from stravation.features.strava_to_notion import sync_strava_to_notion
