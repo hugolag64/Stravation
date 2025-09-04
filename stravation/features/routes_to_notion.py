@@ -775,3 +775,47 @@ def sync_strava_routes_to_notion(*, force: bool = False) -> Tuple[int, int]:
         time.sleep(float(os.getenv("RATE_SAFETY", "0.15")))  # ménage les APIs
 
     return created_or_updated, skipped
+
+# --- Patch: sync "new only" -------------------------------------------------
+from typing import Optional
+
+def sync_routes_to_notion(new_only: bool = True, limit: Optional[int] = None) -> int:
+    """
+    Synchronise les routes Strava -> Notion/GPX.
+    - new_only=True : ne traite que les routes jamais vues OU dont le contenu a changé
+                      (détecté via checksum).
+    - limit : pour couper après N routes (utile en test).
+    Retourne le nombre de routes traitées.
+    """
+    # Ces helpers existent déjà dans ton module (vus dans la liste des callables)
+    seen = get_seen_routes()  # dict[str, str]  {route_id: checksum}
+    # index léger des pages Notion connues (si dispo)
+    try:
+        notion_idx = {str(x.get("route_id")) for x in list_notion_routes_index()}
+    except Exception:
+        notion_idx = set()
+
+    processed = 0
+    for route in _iter_strava_routes():
+        rid = str(route.get("id"))
+        checksum = _checksum_route(route)  # contenu pertinent (points, nom, etc.)
+
+        already_in_db = rid in seen
+        already_in_notion = rid in notion_idx
+        changed = (seen.get(rid) != checksum)
+
+        if new_only and (already_in_db or already_in_notion) and not changed:
+            # déjà vu et identique → on saute
+            continue
+
+        _export_route_gpx(route)   # ton export existant
+        try:
+            mark_route_seen(rid, checksum)
+        except Exception:
+            pass
+
+        processed += 1
+        if limit and processed >= limit:
+            break
+
+    return processed
