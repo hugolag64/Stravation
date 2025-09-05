@@ -1,14 +1,16 @@
 # stravation/cli.py
 from __future__ import annotations
 
+import os
 import typer
 from rich.table import Table
+from notion_client import Client as Notion
 
 from .theme import print
 from .log import setup_logging
 from .config import MORNING_REMINDER_TIME
 from .core.planner import week_plan
-from .integrations.gcal_client import (
+from .integrations.gcal_client import (   # conserve les commandes existantes
     get_or_create_calendar_id,
     push_session,
     push_morning_reminder,
@@ -19,11 +21,9 @@ from .features.routes_to_notion import (
     _iter_strava_routes,             # pour routes-count
     list_notion_routes_index,        # ➜ nouvel index Notion
 )
+from .features.plan_to_calendar import push_plans_window  # ⬅️ NOUVEAU
 from .utils.envtools import write_env_example, check_env
 from .storage import db  # outils cache (SQLite)
-
-import os
-from notion_client import Client as Notion
 
 app = typer.Typer(help="Stravation — propre, minimal, extensible.")
 
@@ -114,7 +114,7 @@ def reset_cache():
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Prévision → Google Calendar
+# Prévision (semaine type) → Google Calendar  [conserve l’existant]
 # ──────────────────────────────────────────────────────────────────────────────
 @app.command("plan-to-gcal")
 def plan_to_gcal(
@@ -173,6 +173,23 @@ def plan_to_gcal(
         f"[ok]Semaine envoyée sur Google Calendar 'Sport'. "
         f"Séances: {pushed} + rappels matin.[/]"
     )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ➜ NOUVEAU : Programmation depuis Notion (Plan) → Google Calendar
+# ──────────────────────────────────────────────────────────────────────────────
+@app.command("plan-push")
+def plan_push(
+    past_days: int = typer.Option(-1, "--past-days", help="Fenêtre passée (J-1 par défaut)."),
+    next_days: int = typer.Option(30, "--next-days", help="Fenêtre future (J+30 par défaut)."),
+):
+    """
+    Exporte les séances Notion (DB 'Plan') vers Google Calendar (agenda Sport).
+    - Lit: Nom de la séance, Date prévue, Sport (select), Type de séance (multi-select), Durée prévue (min)
+    - Crée/maj l'event GCal (couleur par sport, description enrichie)
+    - Met à jour Notion: 'Mois' (select) + 'Durée prévue (min)' si absente
+    """
+    count = push_plans_window(after_days=past_days, before_days=next_days)
+    print(f"[ok]Poussé [bold]{count}[/] séance(s) vers Google Calendar + mise à jour Notion.[/]")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Strava → Notion (Activités)
