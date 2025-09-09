@@ -452,6 +452,17 @@ class PlanTab(ctk.CTkFrame):
         self.ref = self.ref.add(months=delta_months)
         self._render_calendar()
 
+    # ⬇⬇⬇ NEW: bind récursif du double-clic sur toute la case jour
+    def _bind_open_day(self, widget, day: p.DateTime):
+        """Double-clic sur widget ou n’importe lequel de ses enfants -> ouvre la modale."""
+        def _handler(_ev, dd=day):
+            self.after(10, lambda: self._open_dialog(dd))  # petit debounce
+        widget.bind("<Double-Button-1>", _handler, add="+")
+        widget.bind("<Double-1>", _handler, add="+")
+        for ch in widget.winfo_children():
+            self._bind_open_day(ch, day)
+    # ⬆⬆⬆
+
     def _render_calendar(self):
         for w in self.grid.winfo_children():
             w.destroy()
@@ -508,9 +519,11 @@ class PlanTab(ctk.CTkFrame):
 
             border = ctk.CTkFrame(box, corner_radius=12, fg_color="#151517")
             border.pack(fill="both", expand=True, padx=1, pady=1)
+            border.configure(cursor="hand2")  # feedback visuel
 
-            # Double-clic = ouvre la modale (dé-bouncé pour éviter FocusOut immédiat)
-            border.bind("<Double-Button-1>", lambda _ev, dd=dt: self.after(10, lambda: self._open_dialog(dd)))
+            # ⬇ Remplace l’ancien bind par le bind récursif
+            self._bind_open_day(border, dt)
+            # ⬆
 
             head = ctk.CTkFrame(border, fg_color="transparent")
             head.pack(fill="x", padx=10, pady=6)
@@ -544,6 +557,8 @@ class PlanTab(ctk.CTkFrame):
             except Exception:
                 pass
             return
+
+        print(f"[UI] Open dialog {day.to_date_string()}")  # diag
 
         # Pré-remplir si une séance existe déjà ce jour-là (on prend la 1ère)
         existing_list = _sessions_on_day(day)
