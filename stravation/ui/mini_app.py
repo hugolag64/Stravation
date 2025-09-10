@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
+import logging
+import traceback
+import inspect
 from typing import List, Dict, Optional, Callable, Iterable
 
 import customtkinter as ctk
@@ -11,13 +15,29 @@ import pendulum as p
 from stravation.utils.envtools import load_dotenv_if_exists
 load_dotenv_if_exists()
 
+# ───────────────────────────── Logging ─────────────────────────────
+LOG_LEVEL = logging.DEBUG if os.getenv("STRAVATION_DEBUG", "1") not in {"0", "false", "False"} else logging.INFO
+logger = logging.getLogger("stravation.ui")
+if not logger.handlers:
+    logger.setLevel(LOG_LEVEL)
+    fmt = logging.Formatter("[%(asctime)s][%(levelname)s][%(threadName)s] %(message)s", "%H:%M:%S")
+    sh = logging.StreamHandler(sys.stdout); sh.setFormatter(fmt); logger.addHandler(sh)
+    try:
+        fh = logging.FileHandler("stravation_ui.log", encoding="utf-8")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except Exception:
+        pass
+
+def log_ex(title: str, e: BaseException):
+    logger.error("%s: %s\n%s", title, e, "".join(traceback.format_exc()))
+
 # Services / features
 from stravation.services.strava_service import StravaService
 from stravation.services.notion_plans import (
     fetch_plan_sessions,
     create_plan,
     update_plan,
-    ensure_month_and_duration,
     PlanSession,  # modèle Pydantic
 )
 from stravation.services.google_calendar import (
@@ -25,13 +45,11 @@ from stravation.services.google_calendar import (
     month_shifts,
 )
 from stravation.features.strava_to_notion import sync_strava_to_notion
-from stravation.features.routes_to_notion import sync_routes  # ✅ appel direct pour GPX
+from stravation.features.routes_to_notion import sync_routes  # ✅ GPX
 
 # ───────────────────────────── Constantes / Style ─────────────────────────────
 PADDING = 16
 SPORTS_UI = ["Course à pied", "Trail", "Vélo", "CrossFit", "Hyrox"]
-ENDURANCE = {"Course à pied", "Trail", "Vélo"}
-WOD_ONLY = {"CrossFit", "Hyrox"}
 DEFAULT_TIME_H = 7
 DEFAULT_TIME_M = 0
 
@@ -176,7 +194,7 @@ class ImportTab(ctk.CTkFrame):
                 self.after(900, lambda: btn.configure(text="Enregistrer sur Strava"))
             except Exception as e:
                 btn.configure(text=f"Erreur ❌")
-                print("[Strava edit] ", e)
+                log_ex("[Strava edit]", e)
                 self.after(1600, lambda: btn.configure(text="Enregistrer sur Strava"))
 
         btn = ctk.CTkButton(card, text="Enregistrer sur Strava", command=_save_live)
@@ -232,8 +250,25 @@ def _load_type_options_from_notion() -> List[str]:
             return []
         return [opt["name"] for opt in prop["multi_select"].get("options", []) if opt.get("name")]
     except Exception as e:
-        print("[Notion types] ", e)
+        logger.error("[Notion types] %s", e)
         return []
+
+
+# ───────────────────────────── Helper robuste ────────────────────────────────
+def _call_supported(fn: Callable, **kwargs):
+    """
+    Appelle fn en ne passant que les kwargs dont le nom figure dans sa signature.
+    Utile si tes services évoluent.
+    """
+    try:
+        params = set(inspect.signature(fn).parameters.keys())
+        filt = {k: v for k, v in kwargs.items() if k in params}
+        return fn(**filt)
+    except Exception as e:
+        log_ex("[_call_supported]", e)
+        minimal = ["page_id", "name", "sport", "types", "duration_min", "date_iso", "notes"]
+        filt = {k: v for k, v in kwargs.items() if k in minimal}
+        return fn(**filt)
 
 
 # ───────────────────────────── Fenêtre Modale (TOPLEVEL) ─────────────────────
@@ -246,6 +281,7 @@ class EventDialog(ctk.CTkToplevel):
         existing: Optional[PlanSession] = None,
         on_saved: Optional[Callable[[], None]] = None,
     ):
+        logger.debug("[Dialog] __init__ start for %s", date_local.to_iso8601_string())
         super().__init__(master)
         self.configure(fg_color="#151517")
         self.title("Séance")
@@ -254,31 +290,37 @@ class EventDialog(ctk.CTkToplevel):
         self.existing = existing
         self.on_saved = on_saved
 
-        # --- Modale + focus robustes ---
-        self.withdraw()
+        # relation au parent + dimensions
         root = master.winfo_toplevel()
-        self.transient(root)
-        self.resizable(False, False)
+        try:
+            self.transient(root)
+        except Exception as e:
+            log_ex("[Dialog] transient failed", e)
+        self.resizable(True, True)  # autorise le redimensionnement si besoin
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
 
-        pad = 16
-        frame = ctk.CTkFrame(self, fg_color="transparent")
-        frame.pack(fill="both", expand=True, padx=pad, pady=pad)
+        # Layout principal : contenu scrollable + barre boutons fixe
+        outer = ctk.CTkFrame(self, fg_color="transparent")
+        outer.pack(fill="both", expand=True, padx=16, pady=16)
+
+        content = ctk.CTkScrollableFrame(outer, fg_color="transparent", height=480, corner_radius=0)
+        content.pack(fill="both", expand=True)
 
         title = date_local.format("dddd D MMMM YYYY", locale="fr").capitalize()
-        ctk.CTkLabel(frame, text=title, font=("SF Pro Display", 18, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        ctk.CTkLabel(content, text=title, font=("SF Pro Display", 20, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 10))
 
-        ctk.CTkLabel(frame, text="Nom", text_color="#9A9AA2").grid(row=1, column=0, sticky="w")
-        self.e_name = ctk.CTkEntry(frame, placeholder_text="Séance")
+        ctk.CTkLabel(content, text="Nom", text_color="#9A9AA2").grid(row=1, column=0, sticky="w")
+        self.e_name = ctk.CTkEntry(content, placeholder_text="Séance", width=460)
         self.e_name.grid(row=2, column=0, sticky="ew", pady=(2, 8))
 
-        ctk.CTkLabel(frame, text="Sport", text_color="#9A9AA2").grid(row=3, column=0, sticky="w", pady=(4, 2))
-        self.cb_sport = ctk.CTkOptionMenu(frame, values=SPORTS_UI)
+        ctk.CTkLabel(content, text="Sport", text_color="#9A9AA2").grid(row=3, column=0, sticky="w", pady=(4, 2))
+        self.cb_sport = ctk.CTkOptionMenu(content, values=SPORTS_UI, width=240)
         self.cb_sport.set("Course à pied")
-        self.cb_sport.grid(row=4, column=0, sticky="ew")
+        self.cb_sport.grid(row=4, column=0, sticky="w")
 
-        ctk.CTkLabel(frame, text="Type(s)", text_color="#9A9AA2").grid(row=5, column=0, sticky="w", pady=(10, 2))
+        ctk.CTkLabel(content, text="Type(s)", text_color="#9A9AA2").grid(row=5, column=0, sticky="w", pady=(10, 2))
         self._type_vars: Dict[str, ctk.BooleanVar] = {}
-        types_container = ctk.CTkFrame(frame, fg_color="transparent")
+        types_container = ctk.CTkFrame(content, fg_color="transparent")
         types_container.grid(row=6, column=0, sticky="ew")
         cols = 3
         for i, opt in enumerate(self.type_options):
@@ -289,23 +331,30 @@ class EventDialog(ctk.CTkToplevel):
         for i in range(cols):
             types_container.grid_columnconfigure(i, weight=1)
 
-        ctk.CTkLabel(frame, text="Durée (min)", text_color="#9A9AA2").grid(row=7, column=0, sticky="w", pady=(10, 2))
-        self.e_dur = ctk.CTkEntry(frame, placeholder_text="60")
+        ctk.CTkLabel(content, text="Durée (min)", text_color="#9A9AA2").grid(row=7, column=0, sticky="w", pady=(10, 2))
+        self.e_dur = ctk.CTkEntry(content, placeholder_text="60", width=120)
         self.e_dur.grid(row=8, column=0, sticky="w")
 
-        btns = ctk.CTkFrame(frame, fg_color="transparent")
-        btns.grid(row=9, column=0, sticky="ew", pady=(12, 0))
+        ctk.CTkLabel(content, text="Notes (optionnel)", text_color="#9A9AA2").grid(row=9, column=0, sticky="w", pady=(12, 6))
+        self.tb_notes = ctk.CTkTextbox(content, height=96, width=460)
+        self.tb_notes.grid(row=10, column=0, sticky="ew")
+
+        content.grid_columnconfigure(0, weight=1)
+
+        # Barre boutons
+        btns = ctk.CTkFrame(outer, fg_color="transparent")
+        btns.pack(fill="x", pady=(12, 0))
         self.btn_cancel = ctk.CTkButton(btns, text="Annuler", fg_color="#2C2C30", hover_color="#232327",
-                                        command=self._cancel)
-        self.btn_save = ctk.CTkButton(btns, text="Enregistrer", fg_color="#4A90E2", hover_color="#3B78BE",
-                                      command=self._save)
+                                        command=self._cancel, height=38, corner_radius=12)
+        self.btn_save   = ctk.CTkButton(btns, text="Enregistrer", fg_color="#4A90E2", hover_color="#3B78BE",
+                                        command=self._save,   height=38, corner_radius=12)
         self.btn_cancel.pack(side="right")
         self.btn_save.pack(side="right", padx=(0, 8))
 
-        frame.grid_columnconfigure(0, weight=1)
         self.bind("<Escape>", lambda _e: self._cancel())
 
         if existing:
+            logger.debug("[Dialog] Prefill from existing page_id=%s", getattr(existing, "page_id", None))
             self.e_name.insert(0, existing.name or "Séance")
             self.cb_sport.set(existing.sport or "Course à pied")
             try:
@@ -320,39 +369,72 @@ class EventDialog(ctk.CTkToplevel):
             self.cb_sport.set("Course à pied")
             self.e_dur.insert(0, "60")
 
-        # Armement anti-FocusOut immédiat (si jamais tu ajoutes un bind un jour)
-        self._allow_focus_out_close = False
-        self.after(200, lambda: setattr(self, "_allow_focus_out_close", True))
-
         self.after(0, self._center_and_show)
 
     def _center_and_show(self):
-        self.update_idletasks()
-        root = self.master.winfo_toplevel()
-        rw, rh = root.winfo_width(), root.winfo_height()
-        rx, ry = root.winfo_rootx(), root.winfo_rooty()
-        w = max(420, int(rw * 0.34));  h = 430
-        x = rx + (rw - w) // 2;  y = ry + (rh - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
-        self.deiconify()
-        self.lift()
+        logger.debug("[Dialog] _center_and_show()")
         try:
-            self.grab_set()          # modal
-            self.focus_force()
-        except Exception:
-            pass
+            self.update_idletasks()
+            # Taille + centrage écran
+            w, h = 600, 640
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 2)
+            self.geometry(f"{w}x{h}+{x}+{y}")
+            self.minsize(560, 560)
+
+            try:
+                self.deiconify()
+                self.wait_visibility()
+            except Exception:
+                pass
+
+            try:
+                self.attributes("-topmost", True)
+                self.after(300, lambda: self.attributes("-topmost", False))
+            except Exception:
+                pass
+
+            try:
+                self.grab_set()
+                logger.debug("[Dialog] grab_set OK")
+            except Exception as e:
+                log_ex("[Dialog] grab_set failed", e)
+            try:
+                self.focus_set()
+                logger.debug("[Dialog] focus_set OK")
+            except Exception as e:
+                log_ex("[Dialog] focus_set failed", e)
+        except Exception as e:
+            log_ex("[Dialog] _center_and_show error", e)
 
     def _cancel(self):
+        logger.debug("[Dialog] _cancel() called")
         try:
             self.grab_release()
-        except Exception:
-            pass
-        self.destroy()
+            logger.debug("[Dialog] grab_release OK")
+        except Exception as e:
+            log_ex("[Dialog] grab_release failed", e)
+        # reset parent flags → autorise la réouverture
+        try:
+            if hasattr(self.master, "_dlg"):
+                self.master._dlg = None
+            if hasattr(self.master, "_dlg_opening"):
+                self.master._dlg_opening = False
+            logger.debug("[Dialog] parent flags reset (_dlg=None, _dlg_opening=False)")
+        except Exception as e:
+            log_ex("[Dialog] reset parent flags failed", e)
+        try:
+            super().destroy()
+            logger.debug("[Dialog] destroy() done")
+        except Exception as e:
+            log_ex("[Dialog] destroy failed", e)
 
     def _selected_types(self) -> List[str]:
         return [k for k, v in self._type_vars.items() if bool(v.get())]
 
     def _save(self):
+        logger.debug("[Dialog] _save() start")
         name = (self.e_name.get() or "").strip() or "Séance"
         sport = self.cb_sport.get()
         try:
@@ -360,65 +442,66 @@ class EventDialog(ctk.CTkToplevel):
         except Exception:
             duration = 60
         types = self._selected_types()
+        notes = (self.tb_notes.get("1.0", "end") or "").strip()
 
-        # Assure la présence des vues Notion (mois/durée) si nécessaire
-        try:
-            ensure_month_and_duration(self.date_local)
-        except Exception as e:
-            print("[ensure_month_and_duration] ", e)
+        date_iso = self.date_local.to_date_string()
 
         try:
             if self.existing and getattr(self.existing, "page_id", None):
-                # Mise à jour
-                update_plan(
+                logger.debug("[Dialog] update_plan page_id=%s", self.existing.page_id)
+                _call_supported(
+                    update_plan,
                     page_id=self.existing.page_id,
                     name=name,
                     sport=sport,
                     types=types,
                     duration_min=duration,
-                    date_iso=self.date_local.to_date_string(),
-                    time_h=DEFAULT_TIME_H,
-                    time_m=DEFAULT_TIME_M,
+                    date_iso=date_iso,
+                    notes=notes or None,
                 )
             else:
-                # Création
-                create_plan(
+                logger.debug("[Dialog] create_plan on %s", self.date_local.to_iso8601_string())
+                _call_supported(
+                    create_plan,
                     name=name,
                     sport=sport,
                     types=types,
                     duration_min=duration,
-                    date_iso=self.date_local.to_date_string(),
-                    time_h=DEFAULT_TIME_H,
-                    time_m=DEFAULT_TIME_M,
+                    date_iso=date_iso,
+                    notes=notes or None,
                 )
-            # Optionnel: push GCal si tu veux immédiatement créer l’évènement
+
+            # GCal @ 07:00, description = notes
             try:
-                push_sport_event(
+                _call_supported(
+                    push_sport_event,
                     title=name,
                     dt_local=self.date_local.replace(hour=DEFAULT_TIME_H, minute=DEFAULT_TIME_M),
                     duration_min=duration,
                     sport=sport,
+                    description=notes or None,
                 )
             except Exception as eg:
-                print("[push_sport_event] ", eg)
+                log_ex("[push_sport_event]", eg)
 
             if self.on_saved:
+                logger.debug("[Dialog] on_saved callback")
                 self.on_saved()
         except Exception as e:
-            print("[EventDialog _save] ", e)
+            log_ex("[EventDialog _save]", e)
         finally:
             self._cancel()
 
 
 # ───────────────────────────── Calendrier Plans (grille) ─────────────────────
 class PlanTab(ctk.CTkFrame):
-    """Calendrier mensuel. Double-clic jour → EventDialog (modale)."""
+    """Calendrier mensuel. Clic sur une case → EventDialog (modale)."""
     def __init__(self, master):
         super().__init__(master, fg_color="transparent")
         self.ref = p.now()
         self.info_var = ctk.StringVar(value="")
-        self._dlg = None  # ref forte pour modale unique
-        # Charger une fois les types (sinon on ralentit l’ouverture de la modale)
+        self._dlg = None
+        self._dlg_opening = False
         self.type_options: List[str] = _load_type_options_from_notion() or [
             "Endurance", "EF", "Seuil", "VMA", "Force", "Plyo", "Côte",
             "Sortie longue", "Rando-trail", "Crossfit", "Hyrox", "Spé", "Sortie vélo"
@@ -452,18 +535,31 @@ class PlanTab(ctk.CTkFrame):
         self.ref = self.ref.add(months=delta_months)
         self._render_calendar()
 
-    # ⬇⬇⬇ NEW: bind récursif du double-clic sur toute la case jour
-    def _bind_open_day(self, widget, day: p.DateTime):
-        """Double-clic sur widget ou n’importe lequel de ses enfants -> ouvre la modale."""
-        def _handler(_ev, dd=day):
-            self.after(10, lambda: self._open_dialog(dd))  # petit debounce
-        widget.bind("<Double-Button-1>", _handler, add="+")
-        widget.bind("<Double-1>", _handler, add="+")
-        for ch in widget.winfo_children():
-            self._bind_open_day(ch, day)
-    # ⬆⬆⬆
+    def _bind_open_day(self, border, day: p.DateTime):
+        def _handler(ev, dd=day):
+            logger.debug("[Bind] click on %s at %d,%d widget=%s", dd.to_date_string(), ev.x_root, ev.y_root, str(ev.widget))
+            if getattr(self, "_dlg_opening", False):
+                logger.debug("[Bind] ignored: _dlg_opening guard")
+                return "break"
+            if self._dlg and self._dlg.winfo_exists():
+                try:
+                    self._dlg.focus_set()
+                    logger.debug("[Bind] dialog already open -> focus_set")
+                except Exception as e:
+                    log_ex("[Bind] focus_set failed", e)
+                return "break"
+            self._dlg_opening = True
+            self.after(0, lambda: (self._open_dialog(dd), setattr(self, "_dlg_opening", False)))
+            return "break"
+
+        border.bind("<Button-1>", _handler)
+        for ch in border.winfo_children():
+            ch.bind("<Button-1>", lambda e: "break")
+            for sub in ch.winfo_children():
+                sub.bind("<Button-1>", lambda e: "break")
 
     def _render_calendar(self):
+        logger.debug("[Calendar] render for %s", self.ref.start_of("month").to_date_string())
         for w in self.grid.winfo_children():
             w.destroy()
 
@@ -519,11 +615,9 @@ class PlanTab(ctk.CTkFrame):
 
             border = ctk.CTkFrame(box, corner_radius=12, fg_color="#151517")
             border.pack(fill="both", expand=True, padx=1, pady=1)
-            border.configure(cursor="hand2")  # feedback visuel
+            border.configure(cursor="hand2")
 
-            # ⬇ Remplace l’ancien bind par le bind récursif
             self._bind_open_day(border, dt)
-            # ⬆
 
             head = ctk.CTkFrame(border, fg_color="transparent")
             head.pack(fill="x", padx=10, pady=6)
@@ -548,19 +642,17 @@ class PlanTab(ctk.CTkFrame):
                 c = 0
                 r += 1
 
-    # ───────────── Ouverture modale centrée + modale unique ─────────────
     def _open_dialog(self, day: p.DateTime):
-        # Empêche d’ouvrir 2 dialogues
         if self._dlg and self._dlg.winfo_exists():
             try:
                 self._dlg.focus_set()
-            except Exception:
-                pass
+                logger.debug("[UI] Dialog already open -> focus_set")
+            except Exception as e:
+                log_ex("[UI] focus_set failed", e)
             return
 
-        print(f"[UI] Open dialog {day.to_date_string()}")  # diag
+        logger.debug("[UI] Open dialog %s", day.to_date_string())
 
-        # Pré-remplir si une séance existe déjà ce jour-là (on prend la 1ère)
         existing_list = _sessions_on_day(day)
         existing = existing_list[0] if existing_list else None
 
@@ -569,11 +661,9 @@ class PlanTab(ctk.CTkFrame):
             date_local=day,
             type_options=self.type_options,
             existing=existing,
-            on_saved=self._render_calendar,  # rafraîchir après save
+            on_saved=self._render_calendar,
         )
-        # Bloque le flux tant que la fenêtre est ouverte → évite les fermetures fantômes
-        self.wait_window(self._dlg)
-        self._dlg = None
+        # pas de wait_window ; la fermeture remettra _dlg/_dlg_opening
 
 
 # ───────────────────────────── App ─────────────────────────────
@@ -583,6 +673,13 @@ class App(ctk.CTk):
         self.title("Stravanotion — Import & Plans")
         self.geometry("1200x760")
         self.minsize(1080, 640)
+
+        def _report_callback_exception(exc, val, tb):
+            logger.error("[TkException] %s: %s\n%s", exc, val, "".join(traceback.format_tb(tb)))
+        try:
+            self.report_callback_exception = _report_callback_exception  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
         header = ctk.CTkFrame(self)
         header.pack(fill="x", padx=PADDING, pady=(PADDING, 0))
@@ -611,7 +708,6 @@ class App(ctk.CTk):
         footer.pack(fill="x", padx=PADDING, pady=(0, PADDING))
         ctk.CTkLabel(footer, textvariable=self.status_var, anchor="w").pack(side="left", padx=6)
 
-    # ── helpers header (threads) ────────────────────────────────────────────
     def _set_status(self, text: str):
         self.status_var.set(text)
         self.update_idletasks()
@@ -625,7 +721,7 @@ class App(ctk.CTk):
                 self.after(1400, lambda: btn.configure(text=btn._text.split(" ✅")[0]))
             except Exception as e:
                 msg = f"{on_err_prefix}: {e}"
-                print(msg)
+                logger.error(msg)
                 self._set_status(msg)
                 self.after(0, lambda: btn.configure(text="Erreur ❌"))
                 self.after(1600, lambda: btn.configure(text=btn._text.split(" ❌")[0]))
@@ -644,11 +740,8 @@ class App(ctk.CTk):
     def _sync_gpx(self):
         self._set_status("Synchronisation des GPX en cours…")
         self.btn_sync_gpx.configure(text="Sync en cours…")
-
         def _call():
-            # Incrémental : ajoute seulement nouveaux/édités
             return sync_routes(new_only=True)
-
         self._run_bg(
             _call,
             on_ok="GPX synchronisés",
@@ -658,6 +751,8 @@ class App(ctk.CTk):
 
 
 def main():
+    logger.info("=== Stravanotion UI start ===")
+    logger.info("LOG_LEVEL=%s", logging.getLevelName(LOG_LEVEL))
     App().mainloop()
 
 

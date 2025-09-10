@@ -206,3 +206,37 @@ def update_plan(
         return  # rien à faire
 
     client.pages.update(page_id=page_id, properties=props)
+
+def quick_create_plan(
+    name: str,
+    date_local: p.DateTime,
+    sport: str,
+    session_types: Optional[List[str]] = None,
+    duration_min: Optional[int] = None,
+    notes: Optional[str] = None,
+) -> PlanSession:
+    """
+    Création *simplifiée* d'une ligne dans la DB Plans avec les propriétés
+    (Nom, Date prévue, Sport, Type de séance, Durée prévue (min), Notes, Mois).
+
+    Retourne l'objet PlanSession (modèle Pydantic que tu exposes déjà).
+    """
+    if session_types is None:
+        session_types = []
+
+    # Normalisation / propriétés dérivées
+    props: Dict = {
+        "Nom": name.strip(),
+        "Date prévue": date_local,  # pendulum DateTime
+        "Sport": sport,
+        "Type de séance": session_types,
+        "Durée prévue (min)": int(duration_min) if duration_min else None,
+        "Notes": notes or "",
+    }
+
+    # Laisse la fonction utilitaire remplir Mois / Semaine ISO si tu l’utilises
+    props = ensure_month_and_duration(props)
+
+    # Création Notion
+    created = create_plan(props)
+    return created
