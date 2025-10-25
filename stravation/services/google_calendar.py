@@ -5,8 +5,9 @@ import os
 import re
 import json
 import pathlib
-from typing import List, Dict, Optional, Iterable, Tuple
-from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Optional, Iterable
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo  # IANA TZ (ex: "Indian/Reunion")
 
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
@@ -20,7 +21,7 @@ from stravation.utils.envtools import load_dotenv_if_exists
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-ENV_JSON  = "GOOGLE_CREDENTIALS_JSON"        # JSON inline (client OAuth Desktop ou Service Account)
+ENV_JSON  = "GOOGLE_CREDENTIALS_JSON"        # JSON inline (client OAuth Desktop OU Service Account)
 ENV_PATH  = "GOOGLE_CREDENTIALS_PATH"        # chemin vers credentials.json
 ENV_TOKEN = "GOOGLE_TOKEN_PATH"              # chemin token OAuth (défaut: token.json)
 
@@ -30,7 +31,7 @@ ENV_SPORT_CAL = "SPORT_CALENDAR_ID"
 # Détection des shifts dans le titre (A/B/C/W). Adapte ici si besoin.
 _SHIFT_RE = re.compile(r"\b(A|B|C|W)\b", re.I)
 
-# Mapping couleur Google Calendar (string "1".."11"). Ajuste à ton goût.
+# Mapping couleur Google Calendar (string "1".."11"). Conservé si besoin ailleurs.
 SPORT_COLOR_MAP: Dict[str, str] = {
     "Course": "9",
     "Trail": "10",
@@ -44,8 +45,11 @@ SPORT_COLOR_MAP: Dict[str, str] = {
 
 
 def _sport_tz() -> str:
-    # Par défaut: fuseau de La Réunion
     return os.getenv("SPORT_TZ", "Indian/Reunion")
+
+
+def _tzinfo() -> ZoneInfo:
+    return ZoneInfo(_sport_tz())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,8 +167,6 @@ def _assert_visible_calendar(service, cal_id: str):
     if entry:
         return
 
-    # message explicite pour debug
-    # NB: on évite l'API oauth2; on reste neutre
     raise RuntimeError(
         f"Calendrier non visible pour l'utilisateur OAuth courant : '{cal_id}'. "
         "Abonne-toi à cet agenda (Google Agenda ▸ « + » ▸ S’abonner) "
@@ -187,7 +189,7 @@ def assert_can_write_calendar(service, cal_id_or_name: str):
             f"Accès insuffisant sur '{cal_id}' (accessRole={role}). "
             f"Demande « Apporter des modifications aux événements » au propriétaire."
         )
-    return cal_id  # pratique si on a passé un nom
+    return cal_id
 
 
 def _default_sport_calendar_hint() -> Optional[str]:
@@ -197,9 +199,9 @@ def _default_sport_calendar_hint() -> Optional[str]:
 def _as_localized_dt(dt_like: datetime | str) -> datetime:
     """
     Force un datetime timezone-aware en timezone SPORT_TZ.
-    - Si str → fromisoformat (supporte 'YYYY-MM-DDTHH:MM:SS+04:00' ou sans TZ)
-    - Si naïf → on applique SPORT_TZ.
-    - Si aware → conservé tel quel.
+    - Si str → fromisoformat
+    - Si naïf → on applique SPORT_TZ
+    - Si aware → conservé tel quel
     """
     if isinstance(dt_like, str):
         dt = datetime.fromisoformat(dt_like)
@@ -207,11 +209,8 @@ def _as_localized_dt(dt_like: datetime | str) -> datetime:
         dt = dt_like
 
     if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
-        # assigner la tz du sport
-        # NB: datetime n'a pas de zone DB; on applique l'offset courant
-        # Pour simplicité: on convertit via offset fixe à partir de now dans SPORT_TZ.
-        # Ici on laisse le champ timeZone côté API expliciter la zone.
-        return dt.replace(tzinfo=timezone.utc).astimezone(timezone.utc)
+        # appliquer la vraie TZ du sport (pas UTC)
+        return dt.replace(tzinfo=ZoneInfo(_sport_tz()))
     return dt
 
 
@@ -227,6 +226,7 @@ def _choose_color_for_sport(sport: Optional[str], fallback: str = "9") -> str:
 def ensure_calendar(summary: str) -> str:
     """
     Retourne l'ID d'un calendrier nommé `summary`, en le créant si besoin et en s'y abonnant.
+    (Non utilisé par push_sport_event pour éviter toute création involontaire.)
     """
     svc = _service()
 
@@ -245,7 +245,6 @@ def ensure_calendar(summary: str) -> str:
     new_cal = svc.calendars().insert(
         body={"summary": summary, "timeZone": _sport_tz()}
     ).execute()
-    # s'assurer qu'il apparaisse dans la calendarList (rarement nécessaire, mais safe)
     try:
         svc.calendarList().insert(body={"id": new_cal["id"]}).execute()
     except Exception:
@@ -279,17 +278,17 @@ def list_events(calendar_hint: str, time_min_iso: str, time_max_iso: str) -> Lis
 
 def upsert_sport_event(
     *,
-    calendar_id: str,           # ID direct (utilise assert_can_write_calendar si tu as un nom)
+    calendar_id: str,           # ID direct
     start_iso: str,             # "YYYY-MM-DDTHH:MM:SS+04:00"
     duration_min: int,
     title: str,
     description: str = "",
     external_key: Optional[str] = None,  # ex. notion_page_id
-    color_id: str = "9",                 # "Blueberry" (palette Google)
+    color_id: str = "9",
 ) -> str:
     """
     Crée/Met à jour un event (clé = extendedProperties.private.notion_page_id).
-    Si external_key est None, on fait un CREATE simple (pas d’upsert).
+    Si external_key est None, on fait un CREATE simple.
     Retourne l'eventId.
     """
     svc = _service()
@@ -298,8 +297,9 @@ def upsert_sport_event(
 
     body = {
         "summary": title,
-        "description": description,
-        "colorId": color_id,
+        "description": description or None,
+        # on laisse la couleur par défaut du calendrier
+        # "colorId": color_id,
         "start": {"dateTime": start.isoformat(), "timeZone": _sport_tz()},
         "end": {"dateTime": end.isoformat(), "timeZone": _sport_tz()},
     }
@@ -330,84 +330,117 @@ def upsert_sport_event(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Nouveau: création simple d'un event "Sport" + description enrichie + couleur
+# Création simple d'un event "Sport" + déduplication
 # ─────────────────────────────────────────────────────────────────────────────
 def push_sport_event(
-    summary: str,
-    start_local: datetime | str,
+    # alias de titre
+    summary: Optional[str] = None,
+    title: Optional[str] = None,
+    # alias de datetime
+    start_local: Optional[datetime | str] = None,
+    dt_local: Optional[datetime | str] = None,
+    # autres champs
     duration_min: int = 60,
     sport: Optional[str] = None,
     types: Optional[Iterable[str]] = None,
-    calendar_hint: Optional[str] = None,     # ID OU NOM ; défaut ENV_SPORT_CAL → WORK_CALENDAR_ID → "primary"
-    external_key: Optional[str] = None,      # pour upsert (ex: notion_page_id)
+    # cible (ID ou NOM) — alias acceptés
+    calendar_hint: Optional[str] = None,
+    calendar_id: Optional[str] = None,
+    # dédup avancée si fourni
+    external_key: Optional[str] = None,      # ex. notion_page_id (upsert fort)
+    dedup_window_min: int = 10,              # dédup soft si pas d’external_key
 ) -> Dict:
     """
-    Crée (ou met à jour si external_key) un événement "Sport".
-    - summary: titre (ex: 'Séance CAP – Endurance')
-    - start_local: datetime (aware de préférence) ou ISO string ; si naïf → SPORT_TZ
-    - duration_min: durée en minutes
-    - sport: string (pour colorisation + description)
-    - types: itérable de tags (affichés dans description)
-    - calendar_hint: id ou nom d’agenda (sinon ENV_SPORT_CAL/work/primary)
-    - external_key: si fournie → upsert via extendedProperties.private.notion_page_id
+    Crée (ou met à jour) un événement "Sport".
+    - cible = ENV SPORT_CALENDAR_ID (ou WORK_CALENDAR_ID) sauf si calendar_hint/calendar_id est fourni.
+    - dédup:
+        * si external_key → upsert via extendedProperties.private.notion_page_id
+        * sinon → on cherche un event de même summary dans [start-Δ; end+Δ] (Δ=dedup_window_min)
     Retourne l’event créé/mis à jour (dict API).
     """
     svc = _service()
 
-    # Résolution de l'agenda cible
-    hint = (calendar_hint or _default_sport_calendar_hint() or "primary").strip()
+    # Résolution de l'agenda cible (ID ou nom)
+    hint = (calendar_hint or calendar_id or _default_sport_calendar_hint() or "primary").strip()
     cal_id = assert_can_write_calendar(svc, hint)
 
-    # Prépare le corps
-    start_dt = _as_localized_dt(start_local)
-    end_dt = start_dt + timedelta(minutes=duration_min or 60)
+    # Données d'entrée robustes
+    title_txt = (summary or title or "Séance").strip()
 
+    dt_like = start_local if start_local is not None else dt_local
+    if dt_like is None:
+        raise ValueError("start_local/dt_local manquant pour push_sport_event()")
+    start_dt = _as_localized_dt(dt_like)
+    end_dt = start_dt + timedelta(minutes=max(1, int(duration_min or 60)))
+
+    # Description
     desc_lines: List[str] = []
     if sport:
         desc_lines.append(f"Sport : {sport}")
     if types:
-        t = ", ".join([str(x) for x in types])
-        desc_lines.append(f"Type : {t}")
+        joined = ", ".join(str(tag) for tag in types)
+        if joined:
+            desc_lines.append(f"Type : {joined}")
     description = "\n".join(desc_lines) if desc_lines else ""
 
     body = {
-        "summary": summary,
+        "summary": title_txt,
         "description": description or None,
-        "start": {
-            "dateTime": start_dt.isoformat(),
-            "timeZone": _sport_tz(),
-        },
-        "end": {
-            "dateTime": end_dt.isoformat(),
-            "timeZone": _sport_tz(),
-        },
-        "colorId": _choose_color_for_sport(sport, fallback="9"),
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": _sport_tz()},
+        "end":   {"dateTime": end_dt.isoformat(),   "timeZone": _sport_tz()},
+        # On laisse la couleur par défaut du calendrier
+        # "colorId": _choose_color_for_sport(sport, fallback="9"),
     }
     if external_key:
         body["extendedProperties"] = {"private": {"notion_page_id": external_key}}
 
-    # Upsert si external_key
+    # ── Upsert fort si external_key ──────────────────────────────────────────
     if external_key:
-        existing = (
-            svc.events()
-            .list(
-                calendarId=cal_id,
-                privateExtendedProperty=f"notion_page_id={external_key}",
-                timeMin=(start_dt - timedelta(days=2)).isoformat(),
-                timeMax=(end_dt + timedelta(days=2)).isoformat(),
-                singleEvents=True,
+        try:
+            existing = (
+                svc.events()
+                .list(
+                    calendarId=cal_id,
+                    privateExtendedProperty=f"notion_page_id={external_key}",
+                    timeMin=(start_dt - timedelta(days=2)).isoformat(),
+                    timeMax=(end_dt + timedelta(days=2)).isoformat(),
+                    singleEvents=True,
+                )
+                .execute()
+                .get("items", [])
             )
-            .execute()
-            .get("items", [])
-        )
+        except Exception:
+            # certains agendas refusent ce filtre → on ne bloque pas : on insère
+            existing = []
+
         if existing:
             evt_id = existing[0]["id"]
-            updated = svc.events().update(calendarId=cal_id, eventId=evt_id, body=body).execute()
-            return updated
+            return svc.events().update(calendarId=cal_id, eventId=evt_id, body=body).execute()
 
-    created = svc.events().insert(calendarId=cal_id, body=body).execute()
-    return created
+    # ── Dédup soft (même titre dans une petite fenêtre glissante) ───────────
+    time_min = (start_dt - timedelta(minutes=dedup_window_min)).isoformat()
+    time_max = (end_dt + timedelta(minutes=dedup_window_min)).isoformat()
+    existing = (
+        svc.events()
+        .list(
+            calendarId=cal_id,
+            timeMin=time_min,
+            timeMax=time_max,
+            q=title_txt,
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=50,
+        )
+        .execute()
+        .get("items", [])
+    )
+    for ev in existing:
+        if (ev.get("summary") or "") == title_txt:
+            # déjà présent → on ne recrée pas
+            return ev
 
+    # Création
+    return svc.events().insert(calendarId=cal_id, body=body).execute()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Comptage par jour (pour badges UI calendrier)

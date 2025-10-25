@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import time
@@ -159,8 +160,46 @@ def _iter_strava_activities(after_epoch: int) -> Iterable[Tuple[StravaActivity, 
                 start_date_local=it.get("start_date_local"),
                 timezone=it.get("timezone"),
             )
-            yield sa, it  # renvoie aussi le JSON brut
+            yield sa, it
         page += 1
+
+
+def _get_activity_detail(activity_id: int, token: str) -> dict:
+    """
+    Détail complet d'une activité :
+    average_heartrate, max_heartrate, calories, suffer_score, average_cadence,
+    average_watts, weighted_average_watts, map.summary_polyline, etc.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"https://www.strava.com/api/v3/activities/{activity_id}"
+    for _ in range(2):  # petit retry rate-limit
+        r = httpx.get(url, headers=headers, params={"include_all_efforts": False}, timeout=60)
+        if r.status_code == 429:
+            time.sleep(15)
+            continue
+        if r.status_code in (403, 404):
+            return {}
+        r.raise_for_status()
+        return r.json()
+    return {}
+
+
+# ==========================
+# Helpers / calculs
+# ==========================
+
+def _trimp_bannister(duration_s: Optional[float],
+                     hr_avg: Optional[float],
+                     hr_max: Optional[float],
+                     hr_rest: float = 60.0,
+                     sex: str = "M") -> Optional[float]:
+    """TRIMP (Bannister)."""
+    if not duration_s or not hr_avg or not hr_max or hr_max <= hr_rest:
+        return None
+    duration_min = duration_s / 60.0
+    hr_r = (hr_avg - hr_rest) / (hr_max - hr_rest)
+    a, b = (0.86, 1.67) if sex.upper().startswith("F") else (0.64, 1.92)
+    return round(duration_min * hr_r * a * math.e ** (b * hr_r), 1)
 
 
 # ==========================
@@ -181,7 +220,6 @@ def _filter_by_strava_id(prop_type: str, strava_id: str) -> dict:
         return {"number": {"equals": int(strava_id)}}
     if prop_type == "title":
         return {"title": {"equals": str(strava_id)}}
-    # rich_text / text (API = rich_text)
     return {"rich_text": {"equals": str(strava_id)}}
 
 
@@ -286,13 +324,10 @@ def sync_strava_to_notion(
     """
     Retourne (created_or_updated, already_skipped).
 
-    **Important** :
-    - Si full=True OU si l'ENV STRAVATION_FORCE=1, on **ignore le cache seen_activities**
-      (utile pour un backfill complet après purge de Notion).
-    - since_iso : YYYY-MM-DD (prioritaire si fourni)
-    - sinon, horizon = STRAVA_IMPORT_YEARS (défaut: 5)
-    - places : True pour créer/mettre à jour les relations Départ/Arrivée (peut être
-      mis à False pour accélérer/éviter les erreurs réseau pendant un gros backfill).
+    Ajouts:
+    - FC moyenne / FC max
+    - Charge TRIMP (Bannister)
+    - Suffer Score (si dispo)
     """
     notion = Notion(auth=os.environ["NOTION_API_KEY"])
     db_id = os.environ["NOTION_DB_ACTIVITIES"]
@@ -300,50 +335,82 @@ def sync_strava_to_notion(
     schema = _db_schema(notion, db_id)
     strava_id_prop_type = schema.get("Strava ID", "rich_text")
 
-    # Mode "force" (ignore seen)
     env_force = os.getenv("STRAVATION_FORCE", "").strip().lower() in {"1", "true", "yes", "on", "y"}
     force = bool(full or env_force)
 
-    # Détermine "after" (epoch seconds)
     if since_iso:
         after_epoch = p.parse(since_iso).set(hour=0, minute=0, second=0, microsecond=0).int_timestamp
     elif full:
-        after_epoch = 0  # tout l'historique
+        after_epoch = 0
     else:
         last = _get_meta("last_sync_epoch")
-        if last:
-            after_epoch = int(last)
-        else:
-            after_epoch = p.now().subtract(years=DEFAULT_YEARS).int_timestamp
+        after_epoch = int(last) if last else p.now().subtract(years=DEFAULT_YEARS).int_timestamp
 
     created_or_updated = 0
     already = 0
 
-    # Si force explicite, on vide le cache "seen" dès le départ (sécurité)
     if force:
         _clear_seen()
+
+    # Token Strava unique pour les appels détail
+    token = _get_strava_access_token()
 
     for sa, raw in _iter_strava_activities(after_epoch=after_epoch):
         na = _to_notion_activity(sa)
 
-        # Idempotence locale : on ne skippe que si **pas** en mode force
         if (not force) and _is_seen(na.strava_id):
             already += 1
             continue
 
-        # propriétés de base (activité)
+        # 1) Propriétés de base
         props = _props_for_db(na, schema)
 
-        # propriétés relationnelles Départ / Arrivée (si colonnes présentes)
+        # 2) Détail Strava (FC, calories, suffer score, puissance/cadence…)
+        detail = _get_activity_detail(int(na.strava_id), token) or {}
+        avg_hr = detail.get("average_heartrate")
+        max_hr = detail.get("max_heartrate")
+        suffer  = detail.get("suffer_score")  # Premium uniquement
+        avg_cad = detail.get("average_cadence")
+        avg_w   = detail.get("average_watts")
+        wavg_w  = detail.get("weighted_average_watts")
+        kcal    = detail.get("calories")
+
+        # 3) Calcul TRIMP (Bannister)
+        trimp = _trimp_bannister(
+            duration_s=na.moving_time_s,
+            hr_avg=avg_hr,
+            hr_max=max_hr,
+            hr_rest=float(os.getenv("SPORT_HR_REST", "60")),  # optionnel
+            sex=os.getenv("SPORT_SEX", "M"),                  # "M" / "F"
+        )
+
+        # 4) Mapping des nouvelles propriétés (uniquement si présentes dans la DB)
+        if "FC moy (bpm)" in schema:
+            props["FC moy (bpm)"] = {"number": float(avg_hr) if avg_hr else None}
+        if "FC max (bpm)" in schema:
+            props["FC max (bpm)"] = {"number": float(max_hr) if max_hr else None}
+        if "Charge TRIMP" in schema:
+            props["Charge TRIMP"] = {"number": trimp if trimp is not None else None}
+        if "Suffer Score" in schema:
+            props["Suffer Score"] = {"number": float(suffer) if suffer is not None else None}
+        if "Cadence moy" in schema:
+            props["Cadence moy"] = {"number": float(avg_cad) if avg_cad else None}
+        if "Puissance moy (W)" in schema:
+            props["Puissance moy (W)"] = {"number": float(avg_w) if avg_w else None}
+        if "NP / Watts pondérés" in schema:
+            props["NP / Watts pondérés"] = {"number": float(wavg_w) if wavg_w else None}
+        if "Calories" in schema:
+            props["Calories"] = {"number": float(kcal) if kcal else None}
+
+        # 5) Relations Départ / Arrivée (facultatif)
         if places:
             try:
                 place_props = build_activity_place_relations_from_strava(raw)
                 props.update(_filter_existing_props(place_props, schema))
             except httpx.HTTPError:
-                # on ignore les erreurs réseau ponctuelles sur les lieux
                 pass
 
-        # upsert Notion par "Strava ID"
+        # 6) Upsert Notion par "Strava ID"
         page_id = None
         if "Strava ID" in schema:
             page_id = _find_page_id(notion, db_id, strava_id_prop_type, na.strava_id)
@@ -359,7 +426,5 @@ def sync_strava_to_notion(
         # throttle doux pour Notion
         time.sleep(0.15)
 
-    # checkpoint
     _set_meta("last_sync_epoch", str(int(p.now().int_timestamp)))
-
     return created_or_updated, already

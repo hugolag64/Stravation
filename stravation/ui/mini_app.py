@@ -8,6 +8,7 @@ import logging
 import traceback
 import inspect
 from typing import List, Dict, Optional, Callable, Iterable
+from tkinter import messagebox  # ✅ popup erreurs/avertissements
 
 import customtkinter as ctk
 import pendulum as p
@@ -38,7 +39,9 @@ from stravation.services.notion_plans import (
     fetch_plan_sessions,
     create_plan,
     update_plan,
-    PlanSession,  # modèle Pydantic
+    PlanSession,               # (title, date, sport, types, duration_min, month, notes, distance_km)
+    debug_probe,               # optionnel
+    autofill_plan_fields,      # ✅ ajoute Semaine ISO / Mois / Durée depuis Nom
 )
 from stravation.services.google_calendar import (
     push_sport_event,
@@ -50,6 +53,7 @@ from stravation.features.routes_to_notion import sync_routes  # ✅ GPX
 # ───────────────────────────── Constantes / Style ─────────────────────────────
 PADDING = 16
 SPORTS_UI = ["Course à pied", "Trail", "Vélo", "CrossFit", "Hyrox"]
+DISTANCE_SPORTS = {"Course à pied", "Trail", "Vélo"}  # ✅ champ distance visible seulement pour ces sports
 DEFAULT_TIME_H = 7
 DEFAULT_TIME_M = 0
 
@@ -208,14 +212,27 @@ class ImportTab(ctk.CTkFrame):
 
 # ───────────────────────────── Utilitaires Plans (Notion) ─────────────────────
 def _fetch_month_sessions(month_ref: p.DateTime) -> List[PlanSession]:
-    sessions = fetch_plan_sessions(after_days=-7, before_days=60)
-    return [s for s in sessions if s.date.year == month_ref.year and s.date.month == month_ref.month]
+    """Relit Notion borné exactement au mois affiché."""
+    start = month_ref.start_of("month")
+    end = month_ref.end_of("month")
+    sessions = fetch_plan_sessions(
+        ref=start,
+        after_days=0,
+        before_days=(end - start).days
+    )
+    out: List[PlanSession] = []
+    for s in sessions:
+        if s.date and start <= s.date <= end:
+            out.append(s)
+    return out
 
 
 def _sessions_grouped_by_day(sessions: Iterable[PlanSession]) -> Dict[str, List[PlanSession]]:
     out: Dict[str, List[PlanSession]] = {}
     for s in sessions:
-        k = p.parse(s.date_iso).to_date_string()
+        if not s.date:
+            continue
+        k = s.date.to_date_string()
         out.setdefault(k, []).append(s)
     return out
 
@@ -226,8 +243,7 @@ def _sessions_on_day(day_local: p.DateTime) -> List[PlanSession]:
     sessions = fetch_plan_sessions(after_days=-14, before_days=120)
     res: List[PlanSession] = []
     for s in sessions:
-        dt = p.parse(s.date_iso)
-        if start <= dt <= end:
+        if s.date and start <= s.date <= end:
             res.append(s)
     return res
 
@@ -258,7 +274,6 @@ def _load_type_options_from_notion() -> List[str]:
 def _call_supported(fn: Callable, **kwargs):
     """
     Appelle fn en ne passant que les kwargs dont le nom figure dans sa signature.
-    Utile si tes services évoluent.
     """
     try:
         params = set(inspect.signature(fn).parameters.keys())
@@ -266,9 +281,7 @@ def _call_supported(fn: Callable, **kwargs):
         return fn(**filt)
     except Exception as e:
         log_ex("[_call_supported]", e)
-        minimal = ["page_id", "name", "sport", "types", "duration_min", "date_iso", "notes"]
-        filt = {k: v for k, v in kwargs.items() if k in minimal}
-        return fn(**filt)
+        raise
 
 
 # ───────────────────────────── Fenêtre Modale (TOPLEVEL) ─────────────────────
@@ -296,14 +309,14 @@ class EventDialog(ctk.CTkToplevel):
             self.transient(root)
         except Exception as e:
             log_ex("[Dialog] transient failed", e)
-        self.resizable(True, True)  # autorise le redimensionnement si besoin
+        self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self._cancel)
 
         # Layout principal : contenu scrollable + barre boutons fixe
         outer = ctk.CTkFrame(self, fg_color="transparent")
         outer.pack(fill="both", expand=True, padx=16, pady=16)
 
-        content = ctk.CTkScrollableFrame(outer, fg_color="transparent", height=480, corner_radius=0)
+        content = ctk.CTkScrollableFrame(outer, fg_color="transparent", height=520, corner_radius=0)
         content.pack(fill="both", expand=True)
 
         title = date_local.format("dddd D MMMM YYYY", locale="fr").capitalize()
@@ -313,8 +326,14 @@ class EventDialog(ctk.CTkToplevel):
         self.e_name = ctk.CTkEntry(content, placeholder_text="Séance", width=460)
         self.e_name.grid(row=2, column=0, sticky="ew", pady=(2, 8))
 
+        # Quick action placeholder (si besoin plus tard)
+        btn_today = ctk.CTkButton(content, text="Aujourd'hui", width=120,
+                                  command=lambda: None)
+        btn_today.grid(row=2, column=1, padx=(8, 0))
+
         ctk.CTkLabel(content, text="Sport", text_color="#9A9AA2").grid(row=3, column=0, sticky="w", pady=(4, 2))
-        self.cb_sport = ctk.CTkOptionMenu(content, values=SPORTS_UI, width=240)
+        self.cb_sport = ctk.CTkOptionMenu(content, values=SPORTS_UI, width=240,
+                                          command=lambda v: self._on_sport_changed(v))
         self.cb_sport.set("Course à pied")
         self.cb_sport.grid(row=4, column=0, sticky="w")
 
@@ -331,13 +350,21 @@ class EventDialog(ctk.CTkToplevel):
         for i in range(cols):
             types_container.grid_columnconfigure(i, weight=1)
 
+        # Durée
         ctk.CTkLabel(content, text="Durée (min)", text_color="#9A9AA2").grid(row=7, column=0, sticky="w", pady=(10, 2))
         self.e_dur = ctk.CTkEntry(content, placeholder_text="60", width=120)
         self.e_dur.grid(row=8, column=0, sticky="w")
 
-        ctk.CTkLabel(content, text="Notes (optionnel)", text_color="#9A9AA2").grid(row=9, column=0, sticky="w", pady=(12, 6))
+        # ✅ Distance prévue (km) — visible seulement pour Course/Trail/Vélo
+        self.lbl_dist = ctk.CTkLabel(content, text="Distance prévue (km)", text_color="#9A9AA2")
+        self.e_dist = ctk.CTkEntry(content, placeholder_text="ex: 10.0", width=120)
+        self.lbl_dist.grid(row=9, column=0, sticky="w", pady=(10, 2))
+        self.e_dist.grid(row=10, column=0, sticky="w")
+
+        # Notes
+        ctk.CTkLabel(content, text="Notes (optionnel)", text_color="#9A9AA2").grid(row=11, column=0, sticky="w", pady=(12, 6))
         self.tb_notes = ctk.CTkTextbox(content, height=96, width=460)
-        self.tb_notes.grid(row=10, column=0, sticky="ew")
+        self.tb_notes.grid(row=12, column=0, sticky="ew")
 
         content.grid_columnconfigure(0, weight=1)
 
@@ -353,9 +380,10 @@ class EventDialog(ctk.CTkToplevel):
 
         self.bind("<Escape>", lambda _e: self._cancel())
 
+        # Prefill si édition
         if existing:
             logger.debug("[Dialog] Prefill from existing page_id=%s", getattr(existing, "page_id", None))
-            self.e_name.insert(0, existing.name or "Séance")
+            self.e_name.insert(0, existing.title or "Séance")
             self.cb_sport.set(existing.sport or "Course à pied")
             try:
                 self.e_dur.insert(0, str(int(existing.duration_min or 60)))
@@ -364,45 +392,59 @@ class EventDialog(ctk.CTkToplevel):
             for t in (existing.types or []):
                 if t in self._type_vars:
                     self._type_vars[t].set(True)
+            try:
+                if hasattr(existing, "distance_km") and existing.distance_km is not None:
+                    self.e_dist.insert(0, str(existing.distance_km))
+            except Exception:
+                pass
         else:
             self.e_name.insert(0, "Séance")
             self.cb_sport.set("Course à pied")
             self.e_dur.insert(0, "60")
 
+        # Applique la visibilité correcte du champ distance
+        self._on_sport_changed(self.cb_sport.get())
+
         self.after(0, self._center_and_show)
+
+    def _on_sport_changed(self, value: str):
+        show = value in DISTANCE_SPORTS
+        try:
+            if show:
+                self.lbl_dist.grid()
+                self.e_dist.grid()
+            else:
+                self.lbl_dist.grid_remove()
+                self.e_dist.grid_remove()
+        except Exception as e:
+            log_ex("[Dialog] _on_sport_changed", e)
 
     def _center_and_show(self):
         logger.debug("[Dialog] _center_and_show()")
         try:
             self.update_idletasks()
-            # Taille + centrage écran
-            w, h = 600, 640
+            w, h = 600, 700
             sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
             x = max(0, (sw - w) // 2)
             y = max(0, (sh - h) // 2)
             self.geometry(f"{w}x{h}+{x}+{y}")
-            self.minsize(560, 560)
+            self.minsize(560, 600)
 
             try:
-                self.deiconify()
-                self.wait_visibility()
+                self.deiconify(); self.wait_visibility()
             except Exception:
                 pass
-
             try:
                 self.attributes("-topmost", True)
                 self.after(300, lambda: self.attributes("-topmost", False))
             except Exception:
                 pass
-
             try:
-                self.grab_set()
-                logger.debug("[Dialog] grab_set OK")
+                self.grab_set(); logger.debug("[Dialog] grab_set OK")
             except Exception as e:
                 log_ex("[Dialog] grab_set failed", e)
             try:
-                self.focus_set()
-                logger.debug("[Dialog] focus_set OK")
+                self.focus_set(); logger.debug("[Dialog] focus_set OK")
             except Exception as e:
                 log_ex("[Dialog] focus_set failed", e)
         except Exception as e:
@@ -411,22 +453,17 @@ class EventDialog(ctk.CTkToplevel):
     def _cancel(self):
         logger.debug("[Dialog] _cancel() called")
         try:
-            self.grab_release()
-            logger.debug("[Dialog] grab_release OK")
+            self.grab_release(); logger.debug("[Dialog] grab_release OK")
         except Exception as e:
             log_ex("[Dialog] grab_release failed", e)
-        # reset parent flags → autorise la réouverture
         try:
-            if hasattr(self.master, "_dlg"):
-                self.master._dlg = None
-            if hasattr(self.master, "_dlg_opening"):
-                self.master._dlg_opening = False
+            if hasattr(self.master, "_dlg"): self.master._dlg = None
+            if hasattr(self.master, "_dlg_opening"): self.master._dlg_opening = False
             logger.debug("[Dialog] parent flags reset (_dlg=None, _dlg_opening=False)")
         except Exception as e:
             log_ex("[Dialog] reset parent flags failed", e)
         try:
-            super().destroy()
-            logger.debug("[Dialog] destroy() done")
+            super().destroy(); logger.debug("[Dialog] destroy() done")
         except Exception as e:
             log_ex("[Dialog] destroy failed", e)
 
@@ -435,58 +472,93 @@ class EventDialog(ctk.CTkToplevel):
 
     def _save(self):
         logger.debug("[Dialog] _save() start")
+
+        # Champs UI
         name = (self.e_name.get() or "").strip() or "Séance"
         sport = self.cb_sport.get()
+
         try:
-            duration = int(self.e_dur.get().strip() or "60")
+            duration = int(float(self.e_dur.get().strip() or "60"))
         except Exception:
             duration = 60
+
         types = self._selected_types()
         notes = (self.tb_notes.get("1.0", "end") or "").strip()
 
-        date_iso = self.date_local.to_date_string()
+        # Distance prévue (si CAP / Trail / Vélo)
+        distance_km = None
+        try:
+            if hasattr(self, "e_dist"):
+                raw = (self.e_dist.get() or "").strip()
+                if raw:
+                    distance_km = float(raw.replace(",", "."))
+            if sport not in {"Course à pied", "Trail", "Vélo"}:
+                distance_km = None
+        except Exception:
+            distance_km = None
+
+        # Dates
+        date_iso = self.date_local.to_date_string()  # pour Notion (compat)
+        start_dt = self.date_local.replace(hour=DEFAULT_TIME_H, minute=DEFAULT_TIME_M)  # GCal @ 07:00
+
+        notion_page_id: Optional[str] = None
 
         try:
+            # ── Notion: create / update ─────────────────────────────────────────
             if self.existing and getattr(self.existing, "page_id", None):
                 logger.debug("[Dialog] update_plan page_id=%s", self.existing.page_id)
-                _call_supported(
+                page = _call_supported(
                     update_plan,
                     page_id=self.existing.page_id,
-                    name=name,
+                    title=name,
                     sport=sport,
                     types=types,
                     duration_min=duration,
-                    date_iso=date_iso,
+                    date=self.date_local,   # pendulum DateTime
+                    date_iso=date_iso,      # compat
                     notes=notes or None,
+                    distance_km=distance_km,
                 )
+                notion_page_id = getattr(self.existing, "page_id", None) or (page or {}).get("id")
             else:
                 logger.debug("[Dialog] create_plan on %s", self.date_local.to_iso8601_string())
-                _call_supported(
+                page = _call_supported(
                     create_plan,
-                    name=name,
+                    title=name,
+                    date=self.date_local,   # pendulum DateTime
+                    date_iso=date_iso,      # compat
                     sport=sport,
                     types=types,
                     duration_min=duration,
-                    date_iso=date_iso,
                     notes=notes or None,
+                    distance_km=distance_km,
                 )
+                notion_page_id = (page or {}).get("id")
 
-            # GCal @ 07:00, description = notes
+            # ── Google Calendar: un seul event dans l’agenda SPORT_CALENDAR_ID ──
             try:
+                hint = os.getenv("SPORT_CALENDAR_ID")
                 _call_supported(
                     push_sport_event,
-                    title=name,
-                    dt_local=self.date_local.replace(hour=DEFAULT_TIME_H, minute=DEFAULT_TIME_M),
+                    summary=name,
+                    start_local=start_dt,
                     duration_min=duration,
                     sport=sport,
-                    description=notes or None,
+                    types=types,
+                    calendar_hint=hint,
+                    external_key=notion_page_id or name,  # upsert par page Notion
+                    skip_if_exists=True,
                 )
             except Exception as eg:
-                log_ex("[push_sport_event]", eg)
+                messagebox.showwarning(
+                    "Google Calendar",
+                    f"Créé dans Notion, mais GCal a échoué:\n{eg}"
+                )
 
             if self.on_saved:
                 logger.debug("[Dialog] on_saved callback")
                 self.on_saved()
+
         except Exception as e:
             log_ex("[EventDialog _save]", e)
         finally:
@@ -519,6 +591,14 @@ class PlanTab(ctk.CTkFrame):
         self.month_lbl = ctk.CTkLabel(header, text="", font=("SF Pro Display", 18, "bold"))
         self.month_lbl.pack(side="left", padx=10)
 
+        # ➕ Boutons utilitaires
+        ctk.CTkButton(header, text="↻ Rafraîchir", width=120,
+                      command=self.refresh_calendar).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(header, text="📤 Push GCal (mois)", width=160,
+                      command=self._push_month_to_gcal).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(header, text="🧮 Autofill Plans", width=150,
+                      command=self._autofill_now).pack(side="right", padx=(8, 0))  # ✅ relance manuelle
+
         ctk.CTkLabel(header, textvariable=self.info_var, text_color="#A0A0A0").pack(side="right")
 
         body = ctk.CTkFrame(self, corner_radius=18)
@@ -526,6 +606,22 @@ class PlanTab(ctk.CTkFrame):
         self.grid = ctk.CTkFrame(body, fg_color="transparent")
         self.grid.pack(fill="both", expand=True)
         self._render_calendar()
+
+    def _autofill_now(self):
+        def job():
+            try:
+                stats = autofill_plan_fields()
+                self.info_var.set(f"Autofill OK (week={stats['week']}, month={stats['month']}, dur={stats['duration']})")
+                self.after(0, self._render_calendar)
+            except Exception as e:
+                self.info_var.set(f"Autofill err: {e}")
+        threading.Thread(target=job, daemon=True).start()
+
+    def refresh_calendar(self):
+        try:
+            self._render_calendar()
+        except Exception as e:
+            print(f"[PlanTab] refresh_calendar error: {e}")
 
     def _today(self):
         self.ref = p.now()
@@ -629,7 +725,7 @@ class PlanTab(ctk.CTkFrame):
             if badge:
                 badge.pack(side="right")
 
-            titles = [s.name for s in plans_by_day.get(day_key, [])][:3]
+            titles = [s.title for s in plans_by_day.get(day_key, [])][:3]
             for t in titles:
                 tag = ctk.CTkLabel(
                     border, text="• " + t, anchor="w",
@@ -663,8 +759,52 @@ class PlanTab(ctk.CTkFrame):
             existing=existing,
             on_saved=self._render_calendar,
         )
-        # pas de wait_window ; la fermeture remettra _dlg/_dlg_opening
 
+    # ───────── Push GCal (mois courant) ─────────
+    def _push_month_to_gcal(self):
+        # Avant de pousser, s’assure que la DB a bien Semaine/Mois/Durée renseignés
+        self._autofill_now()
+
+        def job():
+            try:
+                sessions = _fetch_month_sessions(self.ref)
+                if not sessions:
+                    self.after(0, lambda: messagebox.showinfo("Google Calendar", "Aucune séance à pousser pour ce mois."))
+                    return
+
+                hint = os.getenv("SPORT_CALENDAR_ID")
+                pushed, errors = 0, []
+
+                for s in sessions:
+                    if not s.date:
+                        continue
+                    start_dt = s.date.replace(hour=DEFAULT_TIME_H, minute=DEFAULT_TIME_M)
+                    try:
+                        _call_supported(
+                            push_sport_event,
+                            summary=(s.title or "Séance"),
+                            start_local=start_dt,
+                            duration_min=(s.duration_min or 60),
+                            sport=s.sport,
+                            types=s.types,
+                            calendar_hint=hint,
+                            external_key=s.page_id,   # ← upsert par page Notion
+                        )
+                        pushed += 1
+                    except Exception as e:
+                        errors.append(str(e))
+
+                if errors:
+                    self.after(0, lambda: messagebox.showwarning(
+                        "Google Calendar",
+                        f"Poussées: {pushed} — Erreurs: {len(errors)}\n\n" + "\n".join(errors[:5])
+                    ))
+                else:
+                    self.after(0, lambda: messagebox.showinfo("Google Calendar", f"{pushed} événement(s) poussé(s) dans l’agenda sport."))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Google Calendar", f"Échec push mois: {e}"))
+
+        threading.Thread(target=job, daemon=True).start()
 
 # ───────────────────────────── App ─────────────────────────────
 class App(ctk.CTk):
@@ -696,6 +836,13 @@ class App(ctk.CTk):
         )
         self.btn_sync_gpx.pack(side="left", padx=8)
 
+        # ✅ Lancement de l’autofill au boot (tâche de fond)
+        self.btn_autofill = ctk.CTkButton(
+            header, text="🧮 Autofill Plans",
+            command=self._autofill_bg, height=36, corner_radius=12
+        )
+        self.btn_autofill.pack(side="left", padx=8)
+
         self.status_var = ctk.StringVar(value="Prêt")
         ctk.CTkLabel(header, textvariable=self.status_var, text_color="#A0A0A0").pack(side="right")
 
@@ -707,6 +854,9 @@ class App(ctk.CTk):
         footer = ctk.CTkFrame(self, height=28)
         footer.pack(fill="x", padx=PADDING, pady=(0, PADDING))
         ctk.CTkLabel(footer, textvariable=self.status_var, anchor="w").pack(side="left", padx=6)
+
+        # Boot tasks
+        self.after(150, self._autofill_bg)  # ✅ auto au démarrage
 
     def _set_status(self, text: str):
         self.status_var.set(text)
@@ -747,6 +897,19 @@ class App(ctk.CTk):
             on_ok="GPX synchronisés",
             on_err_prefix="[Sync GPX] Erreur",
             btn=self.btn_sync_gpx,
+        )
+
+    def _autofill_bg(self):
+        self._set_status("Autofill Plans…")
+        self.btn_autofill.configure(text="Autofill en cours…")
+        def _call():
+            stats = autofill_plan_fields()
+            logger.info("[plans] autofill -> %s", stats)
+        self._run_bg(
+            _call,
+            on_ok="Autofill terminé",
+            on_err_prefix="[Autofill] Erreur",
+            btn=self.btn_autofill,
         )
 
 
